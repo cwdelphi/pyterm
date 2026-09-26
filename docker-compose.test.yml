@@ -1,0 +1,115 @@
+services:
+  md:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pyterm/md:latest
+    container_name: test_md
+    ports:
+      - "15588:5588"
+    volumes:
+      - ./app:/app/app
+      - ./web/dist:/app/static:ro
+      - ./config:/app/config
+      - ./logs:/app/logs
+      - ./md:/app/md
+    environment:
+      - TZ=Asia/Shanghai
+      - JWT_SECRET=test_secret_key_for_testing
+      - JWT_EXPIRES_HOURS=24
+      - TURN_SECRET=test_turn_secret
+      - SERVER_PUBLIC_IP=localhost
+      - CONFIG_DIR=/app/config
+      - LOGS_DIR=/app/logs
+      - DATA_DIR=/app/md
+      - DB_PATH=/app/md/data/app.db
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5588/api/config', timeout=3)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  sshd:
+    build:
+      context: ./autotest/docker/sshd
+    container_name: test_sshd
+    ports:
+      - "2222:22"
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep sshd > /dev/null"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  wragent:
+    build:
+      context: ./wragent
+      dockerfile: Dockerfile
+    container_name: test_wragent
+    depends_on:
+      md:
+        condition: service_healthy
+    network_mode: host
+    volumes:
+      - ./wragent/config.json:/config.json:ro
+    command: ["-config", "/config.json"]
+    restart: unless-stopped
+
+  test:
+    build:
+      context: .
+      dockerfile: autotest/docker/test-runner/Dockerfile
+    container_name: test_runner
+    depends_on:
+      md:
+        condition: service_healthy
+      sshd:
+        condition: service_healthy
+    environment:
+      - BASE_URL=http://md:5588
+      - SSH_HOST=sshd
+      - SSH_PORT=22
+      - SSH_USER=testuser
+      - SSH_PASS=testpass123
+      - SFTP_HOST=sshd
+      - SFTP_PORT=22
+      - NODE_ENV=test
+      - DB_PATH=/tmp/test_app.db
+    volumes:
+      - ./autotest:/app/autotest
+      - ./web/dist:/app/web/dist:ro
+      - ./app:/app/app
+      - ./md:/app/md
+      - ./config:/app/config
+      - ./logs:/app/logs
+      - ./screenshots:/app/screenshots
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        echo "=== 注册测试用户 ==="
+        sleep 3
+        curl -sf -X POST http://md:5588/api/auth/register \
+          -H "Content-Type: application/json" \
+          -d '{"username":"admin","password":"123456","email":"admin@test.com"}' || true
+        echo ""
+        echo "=== 登录获取Token ==="
+        TOKEN=$$(curl -sf -X POST http://md:5588/api/auth/login \
+          -H "Content-Type: application/json" \
+          -d '{"username":"admin","password":"123456"}' | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null)
+        echo "Token: $$TOKEN"
+        echo "=== 等待 Agent 上线 ==="
+        for i in $$(seq 1 30); do
+          AGENTS=$$(curl -sf -H "Authorization: Bearer $$TOKEN" http://md:5588/api/webrtc/agents 2>/dev/null | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('agents',[])))" 2>/dev/null || echo "0")
+          if [ "$$AGENTS" -gt "0" ]; then
+            echo "Agent 已上线 ($$AGENTS 个)"
+            break
+          fi
+          echo "等待 Agent... ($$i/30)"
+          sleep 2
+        done
+        echo "=== 运行后端集成测试 ==="
+        cd /app && python3 -m pytest app/tests/test_integration_real_ssh.py app/tests/test_integration_sftp_client.py -v --tb=short || true
+        echo "=== 运行 Playwright E2E 测试 ==="
+        cd /app/autotest && npx playwright test --project=chromium || true
+        echo "=== 测试完成 ==="

@@ -1,0 +1,14 @@
+.git
+.gitignore
+*.md
+docs
+md
+node_modules
+web/node_modules
+web/dist
+__pycache__
+*.pyc
+.env
+README.md
+*.tar.gz
+*.log

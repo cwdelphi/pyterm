@@ -1,0 +1,90 @@
+:root {
+  --accent: #2563eb;
+  --accent-soft: rgba(37, 99, 235, 0.15);
+  --accent-fg: #fff;
+  --radius: 8px;
+
+  /* 按钮语义色 */
+  --btn-primary: #2563eb;
+  --btn-primary-fg: #fff;
+  --btn-success: #22c55e;
+  --btn-success-fg: #fff;
+  --btn-danger: #ef4444;
+  --btn-danger-fg: #fff;
+  --btn-warning: #f59e0b;
+  --btn-warning-fg: #1e293b;
+  --btn-info: #3b82f6;
+  --btn-info-fg: #fff;
+}
+
+:root[data-accent='green'] {
+  --accent: #059669;
+  --accent-soft: rgba(5, 150, 105, 0.18);
+  --btn-primary: #059669;
+}
+
+:root[data-accent='purple'] {
+  --accent: #7c3aed;
+  --accent-soft: rgba(124, 58, 237, 0.18);
+  --btn-primary: #7c3aed;
+}
+
+:root,
+:root[data-theme='light'] {
+  --bg: #f6f8fb;
+  --panel: #ffffff;
+  --panel-2: #f1f5f9;
+  --border: #e2e8f0;
+  --fg: #1e293b;
+  --fg-2: #475569;
+  --muted: #64748b;
+  --code-bg: #f1f5f9;
+  --code-fg: #0f172a;
+  --hl-bg: #0f172a;
+  --hl-fg: #e2e8f0;
+  --quote-bg: #f8fafc;
+  --table-stripe: #f8fafc;
+  --shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 1px 2px rgba(0, 0, 0, 0.04);
+  --shadow-lg: 0 10px 30px rgba(0, 0, 0, 0.15);
+  --mermaid-bg: #ffffff;
+}
+
+:root[data-theme='dark'] {
+  --bg: #0f172a;
+  --panel: #1e293b;
+  --panel-2: #16202f;
+  --border: #334155;
+  --fg: #e2e8f0;
+  --fg-2: #cbd5e1;
+  --muted: #94a3b8;
+  --code-bg: #0b1220;
+  --code-fg: #e2e8f0;
+  --hl-bg: #0b1220;
+  --hl-fg: #e2e8f0;
+  --quote-bg: #16202f;
+  --table-stripe: #16202f;
+  --shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
+  --shadow-lg: 0 10px 30px rgba(0, 0, 0, 0.5);
+  --mermaid-bg: #1e293b;
+}
+
+/* ═══ 设计令牌 v2.0 ═══ */
+
+:root {
+  /* 间距令牌 */
+  --spacing-xs: 8px;
+  --spacing-sm: 12px;
+  --spacing-md: 16px;
+  --spacing-lg: 24px;
+  --spacing-xl: 32px;
+
+  /* 圆角令牌 */
+  --radius-sm: 4px;
+  --radius-xs: 2px;
+
+  /* 状态色 */
+  --status-success: #22c55e;
+  --status-danger: #ef4444;
+  --status-warning: #f59e0b;
+  --status-info: #3b82f6;
+}

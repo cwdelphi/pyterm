@@ -1,0 +1,15 @@
+{
+  "name": "ppy-tools-autotest",
+  "version": "1.0.0",
+  "description": "E2E tests for 泡鱼终端",
+  "scripts": {
+    "test": "npx playwright test",
+    "test:ui": "npx playwright test --ui",
+    "test:remote": "npx playwright test --project=remote",
+    "test:remote-legacy": "npx playwright test --project=remote-legacy",
+    "report": "npx playwright show-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.48.0"
+  }
+}

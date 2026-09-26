@@ -1,0 +1,206 @@
+services:
+  coturn:
+    command: -c /etc/coturn/turnserver.conf
+    container_name: pyterm_coturn
+    dns:
+    - 8.8.8.8
+    - 114.114.114.114
+    - 223.5.5.5
+    image: coturn/coturn:latest
+    ports:
+    - 19302:19302/tcp
+    - 19302:19302/udp
+    - 5349:5349/tcp
+    - 5349:5349/udp
+    - 49160-49259:49160-49259/udp
+    restart: unless-stopped
+    volumes:
+    - ./config/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    - ./config/turn_cert.pem:/etc/coturn/turn_cert.pem:ro
+    - ./config/turn_key.pem:/etc/coturn/turn_key.pem:ro
+  mariadb:
+    container_name: pyterm_mariadb
+    environment:
+      MYSQL_DATABASE: ppy_tools
+      MYSQL_PASSWORD: change_me_pass
+      MYSQL_ROOT_PASSWORD: pyterm_root_2026
+      MYSQL_USER: ppy
+    healthcheck:
+      interval: 10s
+      retries: 5
+      test:
+      - CMD
+      - healthcheck.sh
+      - --connect
+      - --innodb_initialized
+      timeout: 5s
+    image: mariadb:latest
+    ports:
+    - 127.0.0.1:3306:3306
+    restart: unless-stopped
+    volumes:
+    - ./mariadb_data:/var/lib/mysql
+  md:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pyterm_md
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    env_file:
+    - .env
+    environment:
+    - TZ=Asia/Shanghai
+    - CONFIG_DIR=/app/config
+    - LOGS_DIR=/app/logs
+    - DATA_DIR=/app/md
+    - DB_HOST=mariadb
+    - DB_PORT=3306
+    - DB_USER=ppy
+    - DB_PASS=change_me_pass
+    - DB_NAME=ppy_tools
+    - JWT_SECRET=change_me_jwt
+    - CREDENTIAL_KEY=
+    - JWT_EXPIRES_HOURS=24
+    - TURN_SECRET=change_me_turn
+    - MINIO_ENDPOINT=minio:9000
+    - MINIO_ACCESS_KEY=minioadmin
+    - MINIO_SECRET_KEY=change_me_minio
+    - MINIO_BUCKET=pyterm-docs
+    image: pyterm/md:latest
+    restart: unless-stopped
+    volumes:
+    - ./app:/app/app:ro
+    - ./web/dist:/app/static:ro
+    - ./ftproot:/app/ftproot
+    - ./config:/app/config
+    - ./logs:/app/logs
+    - ./md:/app/md
+    - ./wragent/wragent:/app/wragent/wragent:ro
+    - ./wragent/wragent-windows-amd64.exe:/app/wragent/wragent.exe:ro
+    - ./wrgateway/wrgateway:/app/wrgateway/wrgateway:ro
+    - ./wrgateway/wrgateway-windows-amd64.exe:/app/wrgateway/wrgateway.exe:ro
+    - /etc/localtime:/etc/localtime:ro
+    - /etc/timezone:/etc/timezone:ro
+  minio:
+    command: server /data --console-address :9001
+    container_name: pyterm_minio
+    dns:
+    - 8.8.8.8
+    - 114.114.114.114
+    - 223.5.5.5
+    environment:
+      MINIO_ROOT_PASSWORD: change_me_minio
+      MINIO_ROOT_USER: minioadmin
+    image: minio/minio:latest
+    ports:
+    - 9001:9001
+    restart: unless-stopped
+    volumes:
+    - ./minio_data:/data
+  nginx:
+    container_name: pyterm_nginx
+    depends_on:
+    - md
+    dns:
+    - 8.8.8.8
+    - 114.114.114.114
+    - 223.5.5.5
+    image: nginx:alpine
+    ports:
+    - 5588:5588
+    restart: unless-stopped
+    volumes:
+    - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    - ./nginx/ssl:/etc/nginx/ssl:ro
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+    - 'echo Waiting for md to start...'
+    container_name: pyterm_test
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      md:
+        condition: service_started
+    entrypoint:
+    - sh
+    - -c
+    env_file:
+    - .env
+    environment:
+    - TZ=Asia/Shanghai
+    - BASE_URL=http://md:5588
+    - CONFIG_DIR=/app/config
+    - LOGS_DIR=/app/logs
+    - DATA_DIR=/app/md
+    - DB_HOST=mariadb
+    - DB_PORT=3306
+    - DB_USER=ppy
+    - DB_PASS=change_me_pass
+    - DB_NAME=ppy_tools
+    - TESTING=1
+    healthcheck:
+      disable: true
+    profiles:
+    - test
+    volumes:
+    - ./app:/app/app
+    - ./web:/app/web
+    - ./autotest:/app/autotest
+    - ./config:/app/config
+    - ./md:/app/md
+    - ./logs:/app/logs
+    - /etc/localtime:/etc/localtime:ro
+    - /etc/timezone:/etc/timezone:ro
+  test-ssh-server:
+    container_name: pyterm_test_ssh
+    environment:
+    - TZ=Asia/Shanghai
+    - SSH_USER=sshuser
+    - SSH_PASSWORD=change_me_sshpass
+    - SSH_PORT=22
+    - SFTP_USER=sftpuser
+    - SFTP_PASSWORD=change_me_sftppass
+    - SFTP_PORT=2223
+    - RDP_USER=rdpuser
+    - RDP_PASSWORD=rdpPass123
+    - VNC_PASSWORD=vncPass123
+    - SOCKS5_USER=socksuser
+    - SOCKS5_PASSWORD=socksPass123
+    image: nexterm_test_ubuntu-test-server
+    ports:
+    - '2222:22'
+    - '5900:5900'
+    - '3389:3389'
+    restart: unless-stopped
+  wragent:
+    image: pyterm/go-runtime:latest
+    container_name: pyterm_wragent
+    environment:
+    - TZ=Asia/Shanghai
+    entrypoint: [/app/wragent]
+    command: [-config, /config.json]
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+    - ./wragent/wragent:/app/wragent:ro
+    - ./wragent/config.json:/config.json
+  wrgateway:
+    image: pyterm/go-runtime:latest
+    container_name: pyterm_wrgateway
+    environment:
+    - TZ=Asia/Shanghai
+    entrypoint: [/app/wrgateway]
+    command: [-config, /etc/wrgateway/config.json]
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+    - ./wrgateway/wrgateway:/app/wrgateway:ro
+    - ./wrgateway/config.json:/etc/wrgateway/config.json
+    - ./wrgateway/ssl:/etc/wrgateway/ssl:ro
