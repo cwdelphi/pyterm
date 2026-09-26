@@ -1516,7 +1516,7 @@ async def ws_webrtc(ws: WebSocket):
                     if xhost:
                         base_url = f"{xproto}://{xhost}"
                 if not base_url:
-                    base_url = "https://portal.example.com:5588"
+                    base_url = "https://domain:5588"
                 base_url = base_url.rstrip("/")
                 await ws.send_text(json.dumps({
                     "type": "setup_url",

@@ -334,7 +334,7 @@ async def upgrade_agent(agent_id: str, user: dict = Depends(require_permission("
     if agent_id not in _online_agents:
         from fastapi import HTTPException
         raise HTTPException(status_code=400, detail=t("admin.agent_offline"))
-    base_url = os.environ.get("PUBLIC_URL", "https://portal.example.com:5588")
+    base_url = os.environ.get("PUBLIC_URL", "https://domain:5588")
     download_url = f"{base_url}/api/deploy/wragent/linux-amd64"
     ok = await push_upgrade_to_agent(agent_id, latest, download_url)
     if not ok:
@@ -355,7 +355,7 @@ async def upgrade_gateway(gateway_id: str, user: dict = Depends(require_permissi
     if gateway_id not in _online_gateways:
         from fastapi import HTTPException
         raise HTTPException(status_code=400, detail=t("admin.gateway_offline"))
-    base_url = os.environ.get("PUBLIC_URL", "https://portal.example.com:5588")
+    base_url = os.environ.get("PUBLIC_URL", "https://domain:5588")
     download_url = f"{base_url}/api/deploy/wrgateway/linux-amd64"
     ok = await push_upgrade_to_gateway(gateway_id, latest, download_url)
     if not ok:
@@ -744,7 +744,7 @@ def _resolve_public_base(request=None):
         if proto and host:
             base = f"{proto}://{host}"
     if not base:
-        base = "https://portal.example.com:5588"
+        base = "https://domain:5588"
     base = base.rstrip("/")
     if "://" not in base:
         base = f"https://{base}"

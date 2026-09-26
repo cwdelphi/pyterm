@@ -72,7 +72,7 @@ async function copyAgentToken(token: string) {
 **配置文件** (`agent-DBA/config.json`):
 ```json
 {
-  "server_url": "wss://portal.example.com:5588/api/ws/webrtc",
+  "server_url": "wss://domain:5588/api/ws/webrtc",
   "agent_id": "agent-DBA",
   "auth_token": "abc123...",
   "tunnel_local_port": 3306,
@@ -100,7 +100,7 @@ async function copyAgentToken(token: string) {
 **配置文件** (`agent-ops/config.json`):
 ```json
 {
-  "server_url": "wss://portal.example.com:5588/api/ws/webrtc",
+  "server_url": "wss://domain:5588/api/ws/webrtc",
   "agent_id": "agent-ops",
   "auth_token": "def456...",
   "tunnel_local_port": 13389,
@@ -120,7 +120,7 @@ async function copyAgentToken(token: string) {
 **3人的配置文件各自**:
 ```json
 {
-  "server_url": "wss://portal.example.com:5588/api/ws/webrtc",
+  "server_url": "wss://domain:5588/api/ws/webrtc",
   "agent_id": "user-A",
   "auth_token": "...",
   "tunnel_local_port": 6379,
@@ -176,7 +176,7 @@ type Config struct {
 只跑正常模式（现有配置完全兼容）：
 ```json
 {
-  "server_url": "wss://portal.example.com:5588/api/ws/webrtc",
+  "server_url": "wss://domain:5588/api/ws/webrtc",
   "agent_id": "local-agent",
   "auth_token": "98eada13...",
   "ws_reconnect_interval": 5,
@@ -188,7 +188,7 @@ type Config struct {
 正常模式 + 隧道模式同时运行：
 ```json
 {
-  "server_url": "wss://portal.example.com:5588/api/ws/webrtc",
+  "server_url": "wss://domain:5588/api/ws/webrtc",
   "agent_id": "local-agent",
   "auth_token": "98eada13...",
   "ws_reconnect_interval": 5,

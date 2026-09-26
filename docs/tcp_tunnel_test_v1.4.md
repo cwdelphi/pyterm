@@ -46,7 +46,7 @@
 config.json:
 ```json
 {
-  "server_url": "wss://portal.example.com:5588/api/ws/webrtc",
+  "server_url": "wss://domain:5588/api/ws/webrtc",
   "agent_id": "test-tunnel",
   "auth_token": "<从管理后台复制>",
   "ws_reconnect_interval": 5,

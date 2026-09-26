@@ -121,8 +121,8 @@
     "email": "Email"
   },
   "login": {
-    "installTitle": "Public Install Agent (Mode 1)",
-    "installSubtitle": "No account needed, Tailscale-style install",
+    "installTitle": "Install Agent",
+    "installSubtitle": "",
     "installApproveNote": "After installation, log in on this page → Admin → Agents → Pending Agents, then approve to bind it to your account.",
     "scenariosTitle": "📌 Typical Scenarios",
     "scenarioBadge": "Scenario {n}",
@@ -464,7 +464,7 @@
     "deployStep3": "3. The command embeds this Agent's Token (30 min, one-time); it registers directly on start - no web binding needed",
     "deployStep4": "4. If the link expires or fails, click \"Regenerate\"",
     "systemdDesc": "systemd service (auto-sudo if non-root); downloads the latest binary and runs persistently",
-    "deployRequirement": "Target server must be able to reach this portal (wss://portal.example.com:5588)",
+    "deployRequirement": "Target server must be able to reach this portal (wss://domain:5588)",
     "regenerate": "Regenerate",
     "generating": "Generating deploy link...",
     "mode2Note": "Mode 2: account direct-connect - the command embeds the Token; goes online after deploy without web binding",

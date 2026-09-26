@@ -121,8 +121,8 @@
     "email": "邮箱"
   },
   "login": {
-    "installTitle": "公开安装 Agent（模式一）",
-    "installSubtitle": "无需账户，Tailscale 式公开安装",
+    "installTitle": "安装Agent",
+    "installSubtitle": "",
     "installApproveNote": "安装完成后，用本页账户登录 → 管理台 → Agent管理 → 待注册 Agent，点击审批即可绑定到你的账户。",
     "scenariosTitle": "📌 典型使用场景",
     "scenarioBadge": "场景 {n}",
@@ -464,7 +464,7 @@
     "deployStep3": "3. 命令内嵌该 Agent 的 Token（30 分钟有效、单次使用），执行后直接注册上线，无需网页操作",
     "deployStep4": "4. 链接过期或报错时，点击「重新生成」",
     "systemdDesc": "systemd 系统服务（非 root 自动 sudo），下载最新版并常驻运行",
-    "deployRequirement": "需要目标服务器可访问本门户（wss://portal.example.com:5588）",
+    "deployRequirement": "需要目标服务器可访问本门户（wss://domain:5588）",
     "regenerate": "重新生成",
     "generating": "正在生成部署链接...",
     "mode2Note": "模式二：账户直连，命令内嵌 Token，部署后无需网页绑定即上线",

@@ -131,7 +131,7 @@ async function handleLogin() {
           <span class="install-icon">🌐</span>
           <div class="install-head-text">
             <strong>{{ t('login.installTitle') }}</strong>
-            <small>{{ t('login.installSubtitle') }}</small>
+            <small v-if="t('login.installSubtitle')">{{ t('login.installSubtitle') }}</small>
           </div>
           <button class="install-copy" type="button" :class="{ copied: installCopied }" @click="copyInstallCmd">
             {{ installCopied ? t('admin.copied') + ' ✓' : t('admin.copyCommand') }}
