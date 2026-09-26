@@ -944,6 +944,32 @@ def _sftp_conn_kwargs(params: dict) -> dict:
     return kw
 
 
+SFTP_CONNECT_TIMEOUT = 10.0
+
+
+class _SftpConnect:
+    def __init__(self, kw: dict) -> None:
+        self._kw = kw
+        self._conn = None
+
+    async def __aenter__(self):
+        try:
+            self._conn = await asyncio.wait_for(asyncssh.connect(**self._kw), timeout=SFTP_CONNECT_TIMEOUT)
+        except TimeoutError as e:
+            raise TimeoutError(t("sftp.connect_timeout")) from e
+        return self._conn
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        if self._conn is not None:
+            self._conn.close()
+            await self._conn.wait_closed()
+        return False
+
+
+def _sftp_connect(kw: dict) -> _SftpConnect:
+    return _SftpConnect(kw)
+
+
 def _format_mode(mode: int) -> str:
     if _sftp_stat.S_ISLNK(mode):
         prefix = "l"
@@ -971,7 +997,7 @@ async def sftp_client_list(req: SftpClientReq, user: dict = Depends(get_current_
     kw = _sftp_conn_kwargs(req.model_dump())
     path = req.path or "/"
     try:
-        async with asyncssh.connect(**kw) as conn:
+        async with _sftp_connect(kw) as conn:
             async with conn.start_sftp_client() as sftp:
                 items = []
                 async for entry in sftp.scandir(path):
@@ -1020,7 +1046,7 @@ async def sftp_client_list(req: SftpClientReq, user: dict = Depends(get_current_
 async def sftp_client_cwd(req: SftpClientReq, user: dict = Depends(get_current_user)):
     kw = _sftp_conn_kwargs(req.model_dump())
     try:
-        async with asyncssh.connect(**kw) as conn:
+        async with _sftp_connect(kw) as conn:
             async with conn.start_sftp_client() as sftp:
                 cwd = await sftp.getcwd()
                 if not cwd:
@@ -1034,7 +1060,7 @@ async def sftp_client_cwd(req: SftpClientReq, user: dict = Depends(get_current_u
 async def sftp_client_stat(req: SftpClientReq, user: dict = Depends(get_current_user)):
     kw = _sftp_conn_kwargs(req.model_dump())
     try:
-        async with asyncssh.connect(**kw) as conn:
+        async with _sftp_connect(kw) as conn:
             async with conn.start_sftp_client() as sftp:
                 st = await sftp.stat(req.path)
                 mode = st.permissions if hasattr(st, "permissions") else 0
@@ -1054,7 +1080,7 @@ async def sftp_client_stat(req: SftpClientReq, user: dict = Depends(get_current_
 async def sftp_client_read(req: SftpClientReq, user: dict = Depends(get_current_user)):
     kw = _sftp_conn_kwargs(req.model_dump())
     try:
-        async with asyncssh.connect(**kw) as conn:
+        async with _sftp_connect(kw) as conn:
             async with conn.start_sftp_client() as sftp:
                 st = await sftp.stat(req.path)
                 size = st.size if hasattr(st, "size") else 0
@@ -1076,7 +1102,7 @@ async def sftp_client_read(req: SftpClientReq, user: dict = Depends(get_current_
 async def sftp_client_write(req: SftpWriteReq, user: dict = Depends(get_current_user)):
     kw = _sftp_conn_kwargs(req.model_dump())
     try:
-        async with asyncssh.connect(**kw) as conn:
+        async with _sftp_connect(kw) as conn:
             async with conn.start_sftp_client() as sftp:
                 async with sftp.open(req.path, "w") as f:
                     await f.write(req.content)
@@ -1105,7 +1131,10 @@ async def sftp_client_download(req: SftpClientReq, user: dict = Depends(get_curr
             )
     kw = _sftp_conn_kwargs(req.model_dump())
     try:
-        conn = await asyncssh.connect(**kw)
+        try:
+            conn = await asyncio.wait_for(asyncssh.connect(**kw), timeout=SFTP_CONNECT_TIMEOUT)
+        except TimeoutError as e:
+            raise TimeoutError(t("sftp.connect_timeout")) from e
         sftp_ctx = conn.start_sftp_client()
         sftp = await sftp_ctx.__aenter__()
         filename = posixpath.basename(req.path)
@@ -1149,7 +1178,7 @@ async def sftp_client_upload(
 ):
     kw = _sftp_conn_kwargs({"id": id, "host": host, "port": port, "username": username, "auth_type": auth_type, "password": password, "key_path": key_path})
     try:
-        async with asyncssh.connect(**kw) as conn:
+        async with _sftp_connect(kw) as conn:
             async with conn.start_sftp_client() as sftp:
                 target = posixpath.join(path, file.filename)
                 content = await file.read()
@@ -1164,7 +1193,7 @@ async def sftp_client_upload(
 async def sftp_client_mkdir(req: SftpMkdirReq, user: dict = Depends(get_current_user)):
     kw = _sftp_conn_kwargs(req.model_dump())
     try:
-        async with asyncssh.connect(**kw) as conn:
+        async with _sftp_connect(kw) as conn:
             async with conn.start_sftp_client() as sftp:
                 await sftp.mkdir(req.path)
                 return {"ok": True}
@@ -1176,7 +1205,7 @@ async def sftp_client_mkdir(req: SftpMkdirReq, user: dict = Depends(get_current_
 async def sftp_client_touch(req: SftpMkdirReq, user: dict = Depends(get_current_user)):
     kw = _sftp_conn_kwargs(req.model_dump())
     try:
-        async with asyncssh.connect(**kw) as conn:
+        async with _sftp_connect(kw) as conn:
             async with conn.start_sftp_client() as sftp:
                 try:
                     async with sftp.open(req.path, "a") as f:
@@ -1193,7 +1222,7 @@ async def sftp_client_touch(req: SftpMkdirReq, user: dict = Depends(get_current_
 async def sftp_client_rename(req: SftpRenameReq, user: dict = Depends(get_current_user)):
     kw = _sftp_conn_kwargs(req.model_dump())
     try:
-        async with asyncssh.connect(**kw) as conn:
+        async with _sftp_connect(kw) as conn:
             async with conn.start_sftp_client() as sftp:
                 parent = posixpath.dirname(req.old_path)
                 new_path = posixpath.join(parent, req.new_name)
@@ -1207,7 +1236,7 @@ async def sftp_client_rename(req: SftpRenameReq, user: dict = Depends(get_curren
 async def sftp_client_delete(req: SftpMkdirReq, user: dict = Depends(get_current_user)):
     kw = _sftp_conn_kwargs(req.model_dump())
     try:
-        async with asyncssh.connect(**kw) as conn:
+        async with _sftp_connect(kw) as conn:
             async with conn.start_sftp_client() as sftp:
                 st = await sftp.stat(req.path)
                 mode = st.permissions if hasattr(st, "permissions") else 0
@@ -1224,7 +1253,7 @@ async def sftp_client_delete(req: SftpMkdirReq, user: dict = Depends(get_current
 async def sftp_client_rmdir(req: SftpMkdirReq, user: dict = Depends(get_current_user)):
     kw = _sftp_conn_kwargs(req.model_dump())
     try:
-        async with asyncssh.connect(**kw) as conn:
+        async with _sftp_connect(kw) as conn:
             async with conn.start_sftp_client() as sftp:
                 await sftp.rmtree(req.path)
                 return {"ok": True}
@@ -1236,7 +1265,7 @@ async def sftp_client_rmdir(req: SftpMkdirReq, user: dict = Depends(get_current_
 async def sftp_client_chmod(req: SftpChmodReq, user: dict = Depends(get_current_user)):
     kw = _sftp_conn_kwargs(req.model_dump())
     try:
-        async with asyncssh.connect(**kw) as conn:
+        async with _sftp_connect(kw) as conn:
             async with conn.start_sftp_client() as sftp:
                 await sftp.chmod(req.path, req.mode)
                 return {"ok": True}

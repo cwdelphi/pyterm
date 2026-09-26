@@ -60,6 +60,7 @@
   "sftp.permission_denied": "权限不足: {error}",
   "sftp.path_not_found": "路径不存在: {path}",
   "sftp.error": "SFTP 错误: {error}",
+  "sftp.connect_timeout": "SSH 连接超时",
   "sftp.file_too_large": "文件过大，请使用下载功能",
   "sftp.file_not_found": "文件不存在: {path}",
   "sftp.upload_error": "SFTP 上传错误: {error}",

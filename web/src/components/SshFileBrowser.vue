@@ -2,6 +2,7 @@
 import { ref, onMounted, onBeforeUnmount, inject, computed, nextTick, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { api, type SshConn } from '../api'
+import FileEditorModal from './FileEditorModal.vue'
 
 const { t } = useI18n()
 const props = defineProps<{ conn: SshConn; tabId: string; webrtcManager?: any }>()
@@ -33,6 +34,8 @@ const previewContent = ref('')
 const previewPath = ref('')
 const previewIsMd = ref(false)
 const renderedMd = ref('')
+const showEditor = ref(false)
+const editorPath = ref('')
 
 const showNewDialog = ref(false)
 const newType = ref<'file' | 'dir'>('file')
@@ -183,14 +186,19 @@ function renderMarkdown() {
   } catch { renderedMd.value = '<pre>' + previewContent.value.replace(/</g, '&lt;') + '</pre>' }
 }
 
-function toUtf8B64(str: string): string {
-  return btoa(Array.from(new TextEncoder().encode(str), b => String.fromCharCode(b)).join(''))
+function fullPathOf(name: string): string {
+  return currentPath.value.replace(/\/$/, '') + '/' + name
 }
 
-function editorHref(f: RemoteFile): string {
-  const path = currentPath.value.replace(/\/$/, '') + '/' + f.name
-  const params = toUtf8B64(JSON.stringify({ conn: connParams(), path }))
-  return '/editor.html#' + params
+function openEditor(f: RemoteFile) {
+  openEditorByPath(fullPathOf(f.name), f.size)
+  closeContextMenu()
+}
+
+function openEditorByPath(path: string, size = 0) {
+  if (size > 10 * 1024 * 1024) { toast?.warn?.(t('sftpBrowser.fileTooLarge')); return }
+  editorPath.value = path
+  showEditor.value = true
 }
 
 
@@ -425,7 +433,7 @@ onBeforeUnmount(() => { _cleanupCtx(); clearTimers() })
     <!-- Context menu -->
     <Teleport to="body">
       <div v-if="contextMenu.show" class="sfb-ctxmenu" :style="{ left: contextMenu.x + 'px', top: contextMenu.y + 'px' }">
-        <a class="ctx-item" v-if="contextMenu.file && !contextMenu.file!.is_dir" :href="editorHref(contextMenu.file)" target="_blank" @click.stop>{{ t('sftpBrowser.previewEdit') }}</a>
+        <div class="ctx-item" v-if="contextMenu.file && !contextMenu.file!.is_dir" @click="openEditor(contextMenu.file!)">{{ t('sftpBrowser.previewEdit') }}</div>
         <div class="ctx-item" v-if="contextMenu.file && contextMenu.file!.is_dir" @click="contextMenu.file && openMdPreview(contextMenu.file)">{{ t('sftpBrowser.preview') }}</div>
         <div class="ctx-item" @click="contextMenu.file && downloadFile(contextMenu.file)">{{ t('sftpBrowser.download') }}</div>
         <div class="ctx-divider"></div>
@@ -485,7 +493,7 @@ onBeforeUnmount(() => { _cleanupCtx(); clearTimers() })
           <div class="sfb-modal-header">
             <span class="sfb-modal-title">{{ previewPath }}</span>
             <div class="sfb-modal-header-actions">
-              <a v-if="previewIsMd" class="sfb-toolbtn" :href="editorHref({ name: previewPath, size: 0, mtime: '', mode: '', mode_num: 0, is_dir: false, is_link: false, target: '' })" target="_blank">{{ t('sftpBrowser.editAction') }}</a>
+              <button v-if="previewIsMd" class="sfb-toolbtn" @click="openEditorByPath(fullPathOf(previewPath))">{{ t('sftpBrowser.editAction') }}</button>
               <button class="sfb-btn-cancel" @click="showPreview = false">✕</button>
             </div>
           </div>
@@ -494,6 +502,15 @@ onBeforeUnmount(() => { _cleanupCtx(); clearTimers() })
         </div>
       </div>
     </Teleport>
+
+    <!-- File editor overlay -->
+    <FileEditorModal
+      v-model:show="showEditor"
+      :conn-params="connParams()"
+      :path="editorPath"
+      :webrtc-manager="webrtcManager"
+      @saved="loadDir(currentPath)"
+    />
 
 
   </div>

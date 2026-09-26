@@ -92,17 +92,23 @@ class _SFTPConnCtxMgr:
 
 
 class _SSHConnCtxMgr:
-    """async context manager for asyncssh.connect()"""
+    """async context manager / awaitable for asyncssh.connect()"""
     def __init__(self, sftp_mock):
         self._sftp = sftp_mock
-    async def __aenter__(self):
+    def _make_conn(self):
         conn = MagicMock()
         conn.start_sftp_client.return_value = _SFTPConnCtxMgr(self._sftp)
         conn.wait_closed = AsyncMock()
         conn.close = MagicMock()
         return conn
+    async def __aenter__(self):
+        return self._make_conn()
     async def __aexit__(self, *a):
         return False
+    def __await__(self):
+        async def _coro():
+            return self._make_conn()
+        return _coro().__await__()
 
 
 def _connect_ctx(sftp_mock):

@@ -60,6 +60,7 @@
   "sftp.permission_denied": "Permission denied: {error}",
   "sftp.path_not_found": "Path not found: {path}",
   "sftp.error": "SFTP error: {error}",
+  "sftp.connect_timeout": "SSH connection timeout",
   "sftp.file_too_large": "File too large, use download instead",
   "sftp.file_not_found": "File not found: {path}",
   "sftp.upload_error": "SFTP upload error: {error}",

@@ -414,6 +414,8 @@ export const api = {
     postJSON<{size: number; mtime: number; mode: string; is_dir: boolean}>('/api/sftp-client/stat', params),
   sftpClientRead: (params: {host: string; port: number; username: string; auth_type: string; password: string; key_path: string; path: string}) =>
     postJSON<{content: string; encoding: string}>('/api/sftp-client/read', params),
+  sftpClientWrite: (params: {host: string; port: number; username: string; auth_type: string; password: string; key_path: string; path: string; content: string}) =>
+    postJSON<{ok: boolean}>('/api/sftp-client/write', params),
   sftpClientMkdir: (params: {host: string; port: number; username: string; auth_type: string; password: string; key_path: string; path: string}) =>
     postJSON<{ok: boolean}>('/api/sftp-client/mkdir', params),
   sftpClientTouch: (params: {host: string; port: number; username: string; auth_type: string; password: string; key_path: string; path: string}) =>

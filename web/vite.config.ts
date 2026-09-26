@@ -19,8 +19,7 @@ export default defineConfig({
     reportCompressedSize: false,
     rollupOptions: {
       input: {
-        main: resolve(__dirname, 'index.html'),
-        editor: resolve(__dirname, 'editor.html')
+        main: resolve(__dirname, 'index.html')
       },
       output: {
         manualChunks(id: string) {
