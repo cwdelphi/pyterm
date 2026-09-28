@@ -68,26 +68,57 @@ const previewPaneRef = ref<HTMLElement>()
 const editorRef = ref<HTMLDivElement>()
 let cm: EditorView | null = null
 
-// Sidebar collapse
-const sidebarCollapsed = ref(false)
-const sidebarWidth = ref(260)
+// Sidebar collapse (read synchronously at setup → no first-paint jump, survives v-if remount)
+function readStoredWidth(): number {
+  try {
+    const w = Number(localStorage.getItem('sidebarWidth'))
+    if (w) return Math.max(180, Math.min(420, w))
+  } catch {}
+  return 260
+}
+const sidebarCollapsed = ref(localStorage.getItem('docsSidebarCollapsed') === '1')
+const sidebarWidth = ref(readStoredWidth())
 const dragging = ref(false)
+const filterInputRef = ref<HTMLInputElement>()
 
-function onSidebarDragStart(e: MouseEvent) {
+function setSidebarCollapsed(v: boolean) {
+  sidebarCollapsed.value = v
+  try { localStorage.setItem('docsSidebarCollapsed', v ? '1' : '0') } catch {}
+}
+
+function expandAndNew() {
+  setSidebarCollapsed(false)
+  openNew('')
+}
+
+function expandAndSearch() {
+  setSidebarCollapsed(false)
+  nextTick(() => filterInputRef.value?.focus())
+}
+
+function onSidebarDragStart(e: PointerEvent) {
+  e.preventDefault()
   dragging.value = true
   const startX = e.clientX
   const startW = sidebarWidth.value
-  const onMove = (ev: MouseEvent) => {
-    sidebarWidth.value = Math.max(180, Math.min(420, startW + ev.clientX - startX))
+  const maxW = Math.max(180, Math.min(420, window.innerWidth - 520))
+  const prevCursor = document.body.style.cursor
+  const prevSelect = document.body.style.userSelect
+  const onMove = (ev: PointerEvent) => {
+    sidebarWidth.value = Math.max(180, Math.min(maxW, startW + ev.clientX - startX))
   }
   const onUp = () => {
     dragging.value = false
-    document.removeEventListener('mousemove', onMove)
-    document.removeEventListener('mouseup', onUp)
+    document.body.style.cursor = prevCursor
+    document.body.style.userSelect = prevSelect
+    document.removeEventListener('pointermove', onMove)
+    document.removeEventListener('pointerup', onUp)
     localStorage.setItem('sidebarWidth', String(sidebarWidth.value))
   }
-  document.addEventListener('mousemove', onMove)
-  document.addEventListener('mouseup', onUp)
+  document.body.style.cursor = 'col-resize'
+  document.body.style.userSelect = 'none'
+  document.addEventListener('pointermove', onMove)
+  document.addEventListener('pointerup', onUp)
 }
 
 // File tree search
@@ -216,7 +247,6 @@ async function doBrowseRender() {
 onMounted(async () => {
   loadRecent()
   fileTree.value = await api.filesTree()
-  try { sidebarWidth.value = Number(localStorage.getItem('sidebarWidth')) || 260 } catch {}
   window.addEventListener('open-doc', ((e: CustomEvent) => { openFile(e.detail) }) as EventListener)
 })
 
@@ -532,29 +562,42 @@ const fileShortName = () => activeTab.value ? activeTab.value.path.split('/').po
 
 <template>
   <div class="dm-wrap" @keydown="handleKeydown">
-    <div class="breadcrumb" style="position:absolute;top:0;left:260px;right:0;padding:8px 16px;z-index:1;font-size:13px;">{{ t('docs.title') }}</div>
     <!-- 左侧文件树 -->
     <aside
       class="dm-sidebar"
-      :class="{ collapsed: sidebarCollapsed }"
+      :class="{ collapsed: sidebarCollapsed, dragging }"
       :style="sidebarCollapsed ? {} : { width: sidebarWidth + 'px' }"
     >
       <div class="dm-sidebar-head">
         <template v-if="!sidebarCollapsed">
           <div class="dm-sidebar-top">
             <span class="sidebar-label">{{ t('docs.sidebar') }}</span>
-            <button class="icon-btn sm" @click="openNew('')" :title="t('docs.newFile')">＋</button>
+            <div class="dm-sidebar-actions">
+              <button class="icon-btn sm" @click="openNew('')" :title="t('docs.newFile')">＋</button>
+              <button class="icon-btn sm collapse-btn" @click="setSidebarCollapsed(true)" :title="t('docs.collapseSidebar')">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>
+              </button>
+            </div>
           </div>
-          <input
-            v-model="treeFilter"
-            class="dm-tree-filter"
-            :placeholder="t('docs.searchPlaceholder')"
-          />
+          <div class="dm-filter-wrap">
+            <input
+              ref="filterInputRef"
+              v-model="treeFilter"
+              class="dm-tree-filter"
+              :placeholder="t('docs.searchPlaceholder')"
+            />
+            <button v-if="treeFilter" class="dm-filter-clear" @click="treeFilter = ''" :title="t('docs.clearFilter')">×</button>
+          </div>
         </template>
-        <button class="icon-btn sm collapse-btn" @click="sidebarCollapsed = !sidebarCollapsed" :title="sidebarCollapsed ? t('docs.expandSidebar') : t('docs.collapseSidebar')">
-          <svg v-if="sidebarCollapsed" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg>
-          <svg v-else width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>
-        </button>
+        <template v-else>
+          <button class="icon-btn sm collapse-btn dm-rail-btn" @click="setSidebarCollapsed(false)" :title="t('docs.expandSidebar')">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg>
+          </button>
+          <button class="icon-btn sm dm-rail-btn" @click="expandAndNew" :title="t('docs.newFile')">＋</button>
+          <button class="icon-btn sm dm-rail-btn" @click="expandAndSearch" :title="t('docs.searchPlaceholder')">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          </button>
+        </template>
       </div>
 
       <div v-if="!sidebarCollapsed" class="dm-tree">
@@ -593,7 +636,7 @@ const fileShortName = () => activeTab.value ? activeTab.value.path.split('/').po
     </aside>
 
     <!-- Sidebar drag handle -->
-    <div v-if="!sidebarCollapsed" class="dm-sidebar-drag" @mousedown="onSidebarDragStart"></div>
+    <div v-if="!sidebarCollapsed" class="dm-sidebar-drag" @pointerdown="onSidebarDragStart"></div>
 
     <!-- 右侧内容 -->
     <div class="dm-main">
@@ -798,25 +841,37 @@ const fileShortName = () => activeTab.value ? activeTab.value.path.split('/').po
   width:260px; flex-shrink:0; background:var(--panel); border-right:1px solid var(--border);
   display:flex; flex-direction:column; transition: width .2s ease;
 }
-.dm-sidebar.collapsed { width:42px !important; }
+.dm-sidebar.dragging { transition:none; }
+.dm-sidebar.collapsed { width:48px !important; }
 .dm-sidebar-head {
   display:flex; flex-direction:column; gap:8px;
   padding:10px; border-bottom:1px solid var(--border);
 }
-.dm-sidebar.collapsed .dm-sidebar-head { padding:10px 6px; align-items:center; }
-.dm-sidebar-top { display:flex; align-items:center; justify-content:space-between; }
-.sidebar-label { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; font-weight:600; white-space:nowrap; }
+.dm-sidebar.collapsed .dm-sidebar-head { padding:10px 7px; align-items:center; gap:6px; }
+.dm-sidebar-top { display:flex; align-items:center; justify-content:space-between; gap:4px; }
+.dm-sidebar-actions { display:flex; align-items:center; gap:2px; }
+.sidebar-label { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .icon-btn.sm { min-width:28px; min-height:28px; font-size:16px; border-radius:6px; display:flex; align-items:center; justify-content:center; }
 .icon-btn.sm:hover { background:var(--accent-soft); color:var(--accent); }
 .collapse-btn { color:var(--muted); }
 .collapse-btn:hover { color:var(--fg); }
+.dm-rail-btn { color:var(--muted); }
+.dm-rail-btn:hover { color:var(--accent); }
 
+.dm-filter-wrap { position:relative; }
 .dm-tree-filter {
-  width:100%; height:30px; padding:0 10px; font-size:12px;
+  width:100%; height:30px; padding:0 26px 0 10px; font-size:12px;
   border:1px solid var(--border); border-radius:6px; background:var(--panel-2);
   color:var(--fg); outline:none; box-sizing:border-box;
 }
 .dm-tree-filter:focus { border-color:var(--accent); }
+.dm-filter-clear {
+  position:absolute; right:4px; top:50%; transform:translateY(-50%);
+  width:20px; height:20px; padding:0; border:none; background:transparent;
+  color:var(--muted); font-size:14px; line-height:1; cursor:pointer; border-radius:4px;
+  display:flex; align-items:center; justify-content:center;
+}
+.dm-filter-clear:hover { background:var(--panel-2); color:var(--fg); }
 
 /* Tree */
 .dm-tree { flex:1; overflow-y:auto; padding:6px 4px; }

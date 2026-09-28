@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, inject, computed, watch } from 'vue'
+import { ref, onMounted, onUnmounted, inject, computed, watch, type Ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { api, type User, type AuditLog } from '../api'
 import { probeConnType } from '../utils/webrtc'
@@ -34,8 +34,17 @@ function usePagination<T>(data: Ref<T[]>) {
     return data.value.slice(start, start + pageSize)
   })
   const totalPages = computed(() => Math.max(1, Math.ceil(data.value.length / pageSize)))
+  const total = computed(() => data.value.length)
+  const pageNumbers = computed(() => {
+    const pages: number[] = []
+    const start = Math.max(1, page.value - 2)
+    const end = Math.min(totalPages.value, page.value + 2)
+    for (let i = start; i <= end; i++) pages.push(i)
+    return pages
+  })
   function resetPage() { page.value = 1 }
-  return { page, paginated, totalPages, resetPage }
+  function goPage(p: number) { if (p >= 1 && p <= totalPages.value) page.value = p }
+  return { page, paginated, totalPages, total, pageNumbers, resetPage, goPage }
 }
 
 /* ── 用户管理 ── */
@@ -135,12 +144,14 @@ function toggleUserSelect(userId: string) {
   selectedUserIds.value = s
 }
 function toggleAllUsers() {
-  const selectable = filteredUsers.value.filter(u => u.role !== 'admin')
-  if (selectable.length && selectable.every(u => selectedUserIds.value.has(u.id))) {
-    selectedUserIds.value = new Set()
+  const selectable = userPagination.paginated.value.filter(u => u.role !== 'admin')
+  const s = new Set(selectedUserIds.value)
+  if (selectable.length && selectable.every(u => s.has(u.id))) {
+    selectable.forEach(u => s.delete(u.id))
   } else {
-    selectedUserIds.value = new Set(selectable.map(u => u.id))
+    selectable.forEach(u => s.add(u.id))
   }
+  selectedUserIds.value = s
 }
 async function batchDeleteUsers() {
   if (!confirm(t('common.confirmDelete') + ` ${selectedUserIds.value.size} ${t('admin.userCount')}？`)) return
@@ -756,7 +767,7 @@ function fmtAuditTime(ts: string): string {
           <table>
             <thead>
               <tr>
-                <th><input type="checkbox" :checked="filteredUsers.filter(u => u.role !== 'admin').length > 0 && filteredUsers.filter(u => u.role !== 'admin').every(u => selectedUserIds.has(u.id))" @change="toggleAllUsers()" /></th>
+                <th><input type="checkbox" :checked="userPagination.paginated.value.filter(u => u.role !== 'admin').length > 0 && userPagination.paginated.value.filter(u => u.role !== 'admin').every(u => selectedUserIds.has(u.id))" @change="toggleAllUsers()" /></th>
                 <th>{{ t('admin.username') }}</th><th>{{ t('admin.email') }}</th><th>{{ t('admin.role') }}</th><th>{{ t('common.status') }}</th><th>{{ t('admin.lastLogin') }}</th><th>{{ t('admin.createdAt') }}</th><th>{{ t('common.action') }}</th>
               </tr>
             </thead>
@@ -781,11 +792,12 @@ function fmtAuditTime(ts: string): string {
               <tr v-if="!userPagination.paginated.value.length"><td colspan="8" class="empty-row">{{ t('common.noData') }}</td></tr>
             </tbody>
           </table>
-        </div>
-        <div class="table-pagination" v-if="userPagination.totalPages.value > 1">
-          <button class="page-btn" :disabled="userPagination.page.value <= 1" @click="userPagination.page.value--">&lt;</button>
-          <span class="page-info">{{ userPagination.page.value }} / {{ userPagination.totalPages.value }}</span>
-          <button class="page-btn" :disabled="userPagination.page.value >= userPagination.totalPages.value" @click="userPagination.page.value++">&gt;</button>
+          <div class="table-pagination" v-if="userPagination.totalPages.value > 1">
+            <button class="page-btn" :disabled="userPagination.page.value <= 1" @click="userPagination.goPage(userPagination.page.value - 1)">‹ {{ t('common.prev') }}</button>
+            <button v-for="p in userPagination.pageNumbers.value" :key="p" class="page-btn page-num" :class="{ active: p === userPagination.page.value }" @click="userPagination.goPage(p)">{{ p }}</button>
+            <button class="page-btn" :disabled="userPagination.page.value >= userPagination.totalPages.value" @click="userPagination.goPage(userPagination.page.value + 1)">{{ t('common.next') }} ›</button>
+            <span class="page-info">{{ t('common.pageTotal', { n: userPagination.total.value }) }}</span>
+          </div>
         </div>
       </div>
 
@@ -870,11 +882,12 @@ function fmtAuditTime(ts: string): string {
               <tr v-if="!agentPagination.paginated.value.length"><td colspan="9" class="empty-row">{{ t('common.noData') }}</td></tr>
             </tbody>
           </table>
-        </div>
-        <div class="table-pagination" v-if="agentPagination.totalPages.value > 1">
-          <button class="page-btn" :disabled="agentPagination.page.value <= 1" @click="agentPagination.page.value--">&lt;</button>
-          <span class="page-info">{{ agentPagination.page.value }} / {{ agentPagination.totalPages.value }}</span>
-          <button class="page-btn" :disabled="agentPagination.page.value >= agentPagination.totalPages.value" @click="agentPagination.page.value++">&gt;</button>
+          <div class="table-pagination" v-if="agentPagination.totalPages.value > 1">
+            <button class="page-btn" :disabled="agentPagination.page.value <= 1" @click="agentPagination.goPage(agentPagination.page.value - 1)">‹ {{ t('common.prev') }}</button>
+            <button v-for="p in agentPagination.pageNumbers.value" :key="p" class="page-btn page-num" :class="{ active: p === agentPagination.page.value }" @click="agentPagination.goPage(p)">{{ p }}</button>
+            <button class="page-btn" :disabled="agentPagination.page.value >= agentPagination.totalPages.value" @click="agentPagination.goPage(agentPagination.page.value + 1)">{{ t('common.next') }} ›</button>
+            <span class="page-info">{{ t('common.pageTotal', { n: agentPagination.total.value }) }}</span>
+          </div>
         </div>
       </div>
 
@@ -924,11 +937,12 @@ function fmtAuditTime(ts: string): string {
               <tr v-if="!coturnPagination.paginated.value.length"><td colspan="8" class="empty-row">{{ t('common.noData') }}</td></tr>
             </tbody>
           </table>
-        </div>
-        <div class="table-pagination" v-if="coturnPagination.totalPages.value > 1">
-          <button class="page-btn" :disabled="coturnPagination.page.value <= 1" @click="coturnPagination.page.value--">&lt;</button>
-          <span class="page-info">{{ coturnPagination.page.value }} / {{ coturnPagination.totalPages.value }}</span>
-          <button class="page-btn" :disabled="coturnPagination.page.value >= coturnPagination.totalPages.value" @click="coturnPagination.page.value++">&gt;</button>
+          <div class="table-pagination" v-if="coturnPagination.totalPages.value > 1">
+            <button class="page-btn" :disabled="coturnPagination.page.value <= 1" @click="coturnPagination.goPage(coturnPagination.page.value - 1)">‹ {{ t('common.prev') }}</button>
+            <button v-for="p in coturnPagination.pageNumbers.value" :key="p" class="page-btn page-num" :class="{ active: p === coturnPagination.page.value }" @click="coturnPagination.goPage(p)">{{ p }}</button>
+            <button class="page-btn" :disabled="coturnPagination.page.value >= coturnPagination.totalPages.value" @click="coturnPagination.goPage(coturnPagination.page.value + 1)">{{ t('common.next') }} ›</button>
+            <span class="page-info">{{ t('common.pageTotal', { n: coturnPagination.total.value }) }}</span>
+          </div>
         </div>
       </div>
 
@@ -982,11 +996,12 @@ function fmtAuditTime(ts: string): string {
               <tr v-if="!auditPagination.paginated.value.length"><td colspan="6" class="empty-row">{{ t('admin.noLogs') }}</td></tr>
             </tbody>
           </table>
-        </div>
-        <div class="table-pagination" v-if="auditPagination.totalPages.value > 1">
-          <button class="page-btn" :disabled="auditPagination.page.value <= 1" @click="auditPagination.page.value--">&lt;</button>
-          <span class="page-info">{{ auditPagination.page.value }} / {{ auditPagination.totalPages.value }}</span>
-          <button class="page-btn" :disabled="auditPagination.page.value >= auditPagination.totalPages.value" @click="auditPagination.page.value++">&gt;</button>
+          <div class="table-pagination" v-if="auditPagination.totalPages.value > 1">
+            <button class="page-btn" :disabled="auditPagination.page.value <= 1" @click="auditPagination.goPage(auditPagination.page.value - 1)">‹ {{ t('common.prev') }}</button>
+            <button v-for="p in auditPagination.pageNumbers.value" :key="p" class="page-btn page-num" :class="{ active: p === auditPagination.page.value }" @click="auditPagination.goPage(p)">{{ p }}</button>
+            <button class="page-btn" :disabled="auditPagination.page.value >= auditPagination.totalPages.value" @click="auditPagination.goPage(auditPagination.page.value + 1)">{{ t('common.next') }} ›</button>
+            <span class="page-info">{{ t('common.pageTotal', { n: auditPagination.total.value }) }}</span>
+          </div>
         </div>
       </div>
 

@@ -38,6 +38,7 @@
     "allUsers": "All Users",
     "prev": "Prev",
     "next": "Next",
+    "pageTotal": "Total {n}",
     "items": "",
     "prevPage": "<",
     "nextPage": ">",
@@ -212,6 +213,7 @@
     "toc": "TOC",
     "expandSidebar": "Expand sidebar",
     "collapseSidebar": "Collapse sidebar",
+    "clearFilter": "Clear filter",
     "loadingDoc": "Loading...",
     "errorTitle": "Error"
   },

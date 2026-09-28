@@ -16,7 +16,7 @@ async function openAgentConfig(page: import('@playwright/test').Page, agentId: s
   for (let i = 0; i < 5 && !found; i++) {
     found = (await page.locator('tr').filter({ hasText: agentId }).count()) > 0
     if (!found) {
-      const next = page.locator('.page-btn').filter({ hasText: '>' }).first()
+      const next = page.locator('.page-btn').filter({ hasText: '下一页' }).first()
       if (await next.count() && (await next.isEnabled())) {
         await next.click()
         await page.waitForTimeout(500)
