@@ -9,15 +9,63 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pion/webrtc/v4"
 	"github.com/ppy-tools/wragent/config"
 	ws "github.com/ppy-tools/wragent/websocket"
-	"github.com/pion/webrtc/v4"
 )
 
 // tunnelMsg 隧道内TCP消息
 type tunnelMsg struct {
 	connID uint16
 	data   []byte
+}
+
+// 隧道消息大小限制（带冗余余量，不贴上限设计）。
+//
+// 硬上限（不可违反）：
+//
+//	发送侧：pion/sctp 单条消息 65536 字节（association.go defaultMaxMessageSize），
+//	  超限 dc.Send 返回 ErrOutboundPacketTooLarge，整块丢字节导致字节流错位
+//	  （TLS 报 net::ERR_SSL_PROTOCOL_ERROR）。
+//	接收侧：pion/webrtc 读循环缓冲 dataChannelBufferSize = math.MaxUint16 = 65535
+//	  （webrtc/v4 datachannel.go:23）。超限 reassemblyQueue.read 返回
+//	  io.ErrShortBuffer，读循环直接关闭本地 DataChannel 且对端无感知
+//	  （观测为单侧反复 close + 传输卡在 65536 字节）。
+//
+// 冗余设计：总预算取 65535 - tunnelMsgMargin = 64511，两侧硬上限、未来头部
+// 扩展、pion/浏览器版本差异、JSON 封装等任何额外开销都在这 1KB 余量内消化，
+// 不依赖「刚好卡住」的巧合。
+const (
+	tunnelMsgMargin = 1024                    // 相对硬上限预留的冗余余量
+	tunnelHeaderLen = 3                       // [prefix][connID] 消息头长度
+	tunnelMsgBudget = 65535 - tunnelMsgMargin // 单条消息总预算（含头部）
+)
+
+// tunnelMaxPayload 单条隧道消息 payload 上限。
+const tunnelMaxPayload = tunnelMsgBudget - tunnelHeaderLen // 64508
+
+// tunnelUDPReadBuf UDP 读缓冲。payload 经 JSON+base64 后放大约 4/3：
+// 3 + base64(48000)=64000 + JSON 封装(~120) ≈ 64121 ≤ 64511，距硬上限 65535
+// 仍有 1400+ 字节余量。
+const tunnelUDPReadBuf = 48000
+
+// tunnelBackpressureTimeout 背压等待上限：超过后判定发送侧不可用并断开桥接。
+const tunnelBackpressureTimeout = 30 * time.Second
+
+// waitTunnelSendCapacity 背压：DC 发送缓冲超过阈值时暂停读取本地 TCP，
+// 让数据量回落，避免 pion 内部无界堆积。返回 false 表示 DC 不可用或等待超时。
+func waitTunnelSendCapacity(dc *webrtc.DataChannel) bool {
+	deadline := time.Now().Add(tunnelBackpressureTimeout)
+	for dc.BufferedAmount() > dcBackpressureThreshold {
+		if dc.ReadyState() != webrtc.DataChannelStateOpen {
+			return false
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return dc.ReadyState() == webrtc.DataChannelStateOpen
 }
 
 // ── 隧道管理器 ──────────────────────────────────────────────
@@ -32,12 +80,12 @@ type TunnelManager struct {
 
 // TunnelInstance 单个隧道实例
 type TunnelInstance struct {
-	Config     config.TunnelConfig
-	listener   net.Listener
-	udpConn    *net.UDPConn
-	cancel     chan struct{}
-	running    bool
-	mu         sync.Mutex
+	Config   config.TunnelConfig
+	listener net.Listener
+	udpConn  *net.UDPConn
+	cancel   chan struct{}
+	running  bool
+	mu       sync.Mutex
 }
 
 var tunnelManager *TunnelManager
@@ -60,21 +108,58 @@ func InitTunnelManager(wsClient *ws.Client, sh *SignalHandler) *TunnelManager {
 	return tunnelManager
 }
 
-// ReconnectAll 为所有启用且有目标Agent的隧道重发connect_tunnel
+// ReconnectAll 为所有启用且有目标Agent的隧道重发connect_tunnel（按目标去重）
 func (tm *TunnelManager) ReconnectAll() {
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
+	seen := make(map[string]bool)
 	for _, inst := range tm.tunnels {
 		t := inst.Config
-		if !t.Enabled || t.TargetAgentID == "" {
+		if !t.Enabled || t.TargetAgentID == "" || seen[t.TargetAgentID] {
 			continue
 		}
+		seen[t.TargetAgentID] = true
 		if err := tm.ws.SendConnectTunnel(t.TargetAgentID, tm.ws.Token()); err != nil {
 			log.Printf("[TUNNEL] reconnect connect_tunnel to %s failed: %v", t.TargetAgentID, err)
 		} else {
 			log.Printf("[TUNNEL] reconnect connect_tunnel sent to %s for tunnel %s", t.TargetAgentID, t.ID)
 		}
 	}
+}
+
+// hasPendingTunnels 是否存在启用且有目标Agent的隧道
+func (tm *TunnelManager) hasPendingTunnels() bool {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	for _, inst := range tm.tunnels {
+		if inst.Config.Enabled && inst.Config.TargetAgentID != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// StartTunnelWatchdog 启动隧道看门狗（正常模式）。
+// 兜底场景：connect_tunnel 被服务端拒绝（如 target_agent_offline）后无人重试，
+// 对端上线后隧道永久卡死；DC 从未建立时 OnClose 也不会触发。
+func StartTunnelWatchdog(wsClient *ws.Client, interval time.Duration) {
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for range ticker.C {
+			if tunnelManager == nil || !wsClient.IsConnected() {
+				continue
+			}
+			if isTunnelHealthy() || !tunnelManager.hasPendingTunnels() {
+				continue
+			}
+			log.Printf("[TUNNEL] watchdog: DataChannel not ready, reconnecting tunnels")
+			tunnelManager.ReconnectAll()
+		}
+	}()
 }
 
 // ReconcileTunnels 对比并更新隧道配置（热部署核心）
@@ -85,6 +170,10 @@ func (tm *TunnelManager) ReconcileTunnels(newTunnels []config.TunnelConfig) {
 	// 构建新配置索引
 	newMap := make(map[string]config.TunnelConfig)
 	for _, t := range newTunnels {
+		// 阶段C: socks5 已迁出至 plugins/socks5 插件, 旧通路只保留 tcp/udp
+		if t.Protocol == "socks5" {
+			continue
+		}
 		if t.Enabled {
 			newMap[t.ID] = t
 		}
@@ -134,6 +223,24 @@ func (tm *TunnelManager) startTunnel(cfg config.TunnelConfig) *TunnelInstance {
 	return inst
 }
 
+// Stats 运行统计(阶段D: tunnel 插件 Status 汇总用)
+func (tm *TunnelManager) Stats() (int, string) {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	parts := make([]string, 0, len(tm.tunnels))
+	for _, inst := range tm.tunnels {
+		parts = append(parts, fmt.Sprintf("%s:%d", inst.Config.Protocol, inst.Config.LocalPort))
+	}
+	detail := "0 tunnels"
+	if len(parts) > 0 {
+		detail = fmt.Sprintf("%d tunnels", len(parts))
+		for i := 0; i < len(parts); i++ {
+			detail += " " + parts[i]
+		}
+	}
+	return len(tm.tunnels), detail
+}
+
 // StopAll 停止所有隧道
 func (tm *TunnelManager) StopAll() {
 	tm.mu.Lock()
@@ -151,7 +258,9 @@ func (ti *TunnelInstance) ConfigChanged(newCfg config.TunnelConfig) bool {
 	return ti.Config.Protocol != newCfg.Protocol ||
 		ti.Config.LocalPort != newCfg.LocalPort ||
 		ti.Config.TargetAddr != newCfg.TargetAddr ||
-		ti.Config.TargetAgentID != newCfg.TargetAgentID
+		ti.Config.TargetAgentID != newCfg.TargetAgentID ||
+		ti.Config.SocksUsername != newCfg.SocksUsername ||
+		ti.Config.SocksPassword != newCfg.SocksPassword
 }
 
 // Stop 停止隧道
@@ -198,7 +307,7 @@ func (ti *TunnelInstance) startTCPListener(sh *SignalHandler) {
 					continue
 				}
 			}
-			go bridgeTCPConn(conn, ti.Config.TargetAddr, sh)
+			go bridgeTCPConn(conn, ti.Config.TargetAddr, sh, nil)
 		}
 	}
 }
@@ -239,7 +348,7 @@ func (ti *TunnelInstance) startUDPListener(sh *SignalHandler) {
 		}
 	}()
 
-	buf := make([]byte, 65536)
+	buf := make([]byte, tunnelUDPReadBuf)
 	for {
 		select {
 		case <-ti.cancel:
@@ -285,12 +394,15 @@ func (ti *TunnelInstance) startUDPListener(sh *SignalHandler) {
 
 // ── TCP 桥接函数 ──────────────────────────────────────────────
 
-func bridgeTCPConn(conn net.Conn, targetAddr string, sh *SignalHandler) {
+func bridgeTCPConn(conn net.Conn, targetAddr string, sh *SignalHandler, onResult func(ok bool)) {
 	defer conn.Close()
 
 	dc := sh.findTunnelDataChannel()
 	if dc == nil {
 		log.Printf("[TUNNEL] no available tunnel DataChannel")
+		if onResult != nil {
+			onResult(false)
+		}
 		return
 	}
 
@@ -305,40 +417,74 @@ func bridgeTCPConn(conn net.Conn, targetAddr string, sh *SignalHandler) {
 	var port int
 	fmt.Sscanf(portStr, "%d", &port)
 
+	// 先注册等待器与 DataChannel→TCP 队列再发 Connect：
+	// 1) 对端 OK/Data 可能先于本地注册到达，晚注册会丢字节（流错位）；
+	// 2) 等待器晚注册会白等 10s 超时。
+	dataCh := make(chan []byte, 64)
+	tunnelConnsMu.Lock()
+	tunnelConns[connID] = &tunnelConn{
+		ch:     dataCh,
+		cancel: func() { conn.Close() },
+	}
+	tunnelConnsMu.Unlock()
+	unregistered := false
+	unregister := func() {
+		if unregistered {
+			return
+		}
+		unregistered = true
+		tunnelConnsMu.Lock()
+		tc, ok := tunnelConns[connID]
+		if ok {
+			delete(tunnelConns, connID)
+		}
+		tunnelConnsMu.Unlock()
+		if ok {
+			close(tc.ch)
+		}
+	}
+
+	waiter, cancelWait := registerTunnelOKWaiter(connID)
+	defer cancelWait()
+	defer unregister()
+
 	// 发送连接请求
 	reqPayload, _ := json.Marshal(map[string]interface{}{
 		"host": host,
 		"port": port,
 	})
-	tunnelSend(dc, MsgTunnelConnect, connID, reqPayload)
+	if err := tunnelSend(dc, MsgTunnelConnect, connID, reqPayload); err != nil {
+		log.Printf("[TUNNEL] send Connect failed: %s (connID=%d)", err, connID)
+		if onResult != nil {
+			onResult(false)
+		}
+		return
+	}
 
 	// 等待连接确认
-	ok, err := tunnelWaitOK(dc, connID, 10*time.Second)
+	ok, err := waitTunnelOK(waiter, 10*time.Second)
 	if err != nil || !ok {
 		detail := "连接失败"
 		if err != nil {
 			detail = err.Error()
 		}
 		log.Printf("[TUNNEL] TCP connect rejected: %s (connID=%d)", detail, connID)
+		if onResult != nil {
+			onResult(false)
+		}
 		return
+	}
+	if onResult != nil {
+		onResult(true)
 	}
 
 	log.Printf("[TUNNEL] TCP bridge started (connID=%d, remote=%s)", connID, conn.RemoteAddr())
 
-	// 注册DataChannel→TCP转发
-	dataCh := make(chan []byte, 64)
-	tunnelConnsMu.Lock()
-	tunnelConns[connID] = dataCh
-	tunnelConnsMu.Unlock()
-
 	defer func() {
-		tunnelConnsMu.Lock()
-		if ch, ok := tunnelConns[connID]; ok {
-			close(ch)
-			delete(tunnelConns, connID)
+		unregister()
+		if err := tunnelSend(dc, MsgTunnelDisconnect, connID, nil); err != nil {
+			log.Printf("[TUNNEL] send Disconnect failed: %s (connID=%d)", err, connID)
 		}
-		tunnelConnsMu.Unlock()
-		tunnelSend(dc, MsgTunnelDisconnect, connID, nil)
 		log.Printf("[TUNNEL] TCP bridge ended (connID=%d)", connID)
 	}()
 
@@ -350,11 +496,20 @@ func bridgeTCPConn(conn net.Conn, targetAddr string, sh *SignalHandler) {
 	go func() {
 		defer wg.Done()
 		defer close(done)
-		buf := make([]byte, 65536)
+		buf := make([]byte, tunnelMaxPayload)
 		for {
+			// 背压：DC 发送缓冲超阈值时暂停读本地 TCP，避免无界堆积
+			if !waitTunnelSendCapacity(dc) {
+				log.Printf("[TUNNEL] backpressure timeout/unavailable, closing bridge (connID=%d)", connID)
+				return
+			}
 			n, err := conn.Read(buf)
 			if n > 0 {
-				tunnelSend(dc, MsgTunnelData, connID, buf[:n])
+				if sendErr := tunnelSend(dc, MsgTunnelData, connID, buf[:n]); sendErr != nil {
+					// 发送失败说明字节已丢失，继续转发会造成流错位，直接断开
+					log.Printf("[TUNNEL] send Data failed: %s, closing bridge (connID=%d)", sendErr, connID)
+					return
+				}
 			}
 			if err != nil {
 				return
@@ -373,7 +528,12 @@ func bridgeTCPConn(conn net.Conn, targetAddr string, sh *SignalHandler) {
 					return
 				}
 				if len(data) > 0 {
-					conn.Write(data)
+					if _, werr := conn.Write(data); werr != nil {
+						log.Printf("[TUNNEL] TCP write failed: %s (connID=%d), closing conn", werr, connID)
+						// 关闭 conn 让另一侧 Read 返回错误，避免 wg.Wait 永久阻塞
+						conn.Close()
+						return
+					}
 				}
 			case <-done:
 				return
@@ -404,14 +564,16 @@ func bridgeUDPToDC(connID uint16, data []byte, targetAddr string, sh *SignalHand
 
 	// 通过 DataChannel 发送 UDP 数据
 	payload, _ := json.Marshal(map[string]interface{}{
-		"host":       host,
-		"port":       port,
-		"conn_id":    connID,
-		"client_ip":  clientAddr.IP.String(),
+		"host":        host,
+		"port":        port,
+		"conn_id":     connID,
+		"client_ip":   clientAddr.IP.String(),
 		"client_port": clientAddr.Port,
-		"data":       data,
+		"data":        data,
 	})
-	tunnelSend(dc, MsgTunnelUDPData, connID, payload)
+	if err := tunnelSend(dc, MsgTunnelUDPData, connID, payload); err != nil {
+		log.Printf("[TUNNEL] UDP send failed: %s (connID=%d)", err, connID)
+	}
 }
 
 // ── DataChannel 消息路由 ──────────────────────────────────────
@@ -420,10 +582,16 @@ func bridgeUDPToDC(connID uint16, data []byte, targetAddr string, sh *SignalHand
 var (
 	tunnelDC      *webrtc.DataChannel
 	tunnelDCMu    sync.RWMutex
-	tunnelConns   = make(map[uint16]chan []byte)
+	tunnelConns   = make(map[uint16]*tunnelConn)
 	tunnelConnsMu sync.RWMutex
 	tunnelOnClose func()
 )
+
+// tunnelConn 单条隧道TCP连接的本地端点
+type tunnelConn struct {
+	ch     chan []byte
+	cancel func() // 关闭本地 TCP 连接
+}
 
 // SetTunnelOnClose 设置隧道DataChannel关闭回调
 func SetTunnelOnClose(handler func()) {
@@ -432,17 +600,43 @@ func SetTunnelOnClose(handler func()) {
 	tunnelDCMu.Unlock()
 }
 
-// RegisterTunnelDC 注册隧道DataChannel
+// RegisterTunnelDC 注册隧道DataChannel（仅监听端路由）
 func RegisterTunnelDC(dc *webrtc.DataChannel) {
+	registerTunnelDC(dc, nil, nil)
+}
+
+// registerTunnelDC 注册隧道DataChannel，单一 OnMessage/OnClose 持有者。
+//
+// bridgeMsg/bridgeClose 为可选的桥接端（对端 Listener 一侧）回调：
+// bridgeMsg 返回 true 表示已消费该消息。pion 的 OnMessage/OnClose 是单槽，
+// 若监听端与桥接端各自注册会相互覆盖（后者胜出），导致先注册方的路由与
+// 断连回调永久失效，因此必须合并到同一处注册。
+func registerTunnelDC(dc *webrtc.DataChannel,
+	bridgeMsg func(prefix byte, connID uint16, payload []byte) bool,
+	bridgeClose func()) {
+
 	tunnelDCMu.Lock()
 	defer tunnelDCMu.Unlock()
 	tunnelDC = dc
 
 	dc.OnClose(func() {
+		if bridgeClose != nil {
+			bridgeClose()
+		}
 		tunnelDCMu.Lock()
-		tunnelDC = nil
+		// 代际守卫：仅当关闭的是当前隧道 DC 才清空并触发重连。
+		// 旧 peer 的 DC 迟到 OnClose 不得清掉已就绪的新 DC，
+		// 否则会误判断线并引发 ReconnectAll 重连风暴。
+		stale := tunnelDC != dc
+		if !stale {
+			tunnelDC = nil
+		}
 		handler := tunnelOnClose
 		tunnelDCMu.Unlock()
+		if stale {
+			log.Println("[TUNNEL] DataChannel closed (stale, ignored)")
+			return
+		}
 		log.Println("[TUNNEL] DataChannel closed")
 		if handler != nil {
 			go handler()
@@ -459,6 +653,11 @@ func RegisterTunnelDC(dc *webrtc.DataChannel) {
 		connID := binary.BigEndian.Uint16(data[1:3])
 		payload := data[3:]
 
+		// 桥接端优先消费（自己发起的 Connect、自己 dial 出去的 conn 的 Data/Disconnect）
+		if bridgeMsg != nil && bridgeMsg(prefix, connID, payload) {
+			return
+		}
+
 		switch prefix {
 		case MsgTunnelConnectOK:
 			tunnelOKMu.Lock()
@@ -468,26 +667,46 @@ func RegisterTunnelDC(dc *webrtc.DataChannel) {
 					Detail string `json:"detail"`
 				}
 				json.Unmarshal(payload, &resp)
-				ch <- resp.OK
+				// 非阻塞：ch 容量为 1，重复/迟到的 OK 不得卡在锁内
+				select {
+				case ch <- resp.OK:
+				default:
+				}
 			}
 			tunnelOKMu.Unlock()
 		case MsgTunnelData:
 			tunnelConnsMu.RLock()
-			ch, ok := tunnelConns[connID]
+			tc, ok := tunnelConns[connID]
 			tunnelConnsMu.RUnlock()
-			if ok {
-				select {
-				case ch <- payload:
-				default:
+			if !ok {
+				log.Printf("[TUNNEL] data for unknown conn (connID=%d, %d bytes), dropped", connID, len(payload))
+				return
+			}
+			select {
+			case tc.ch <- payload:
+			default:
+				// 队列满：静默丢字节会破坏字节流（TLS/SSH 等直接错位），
+				// 改为断开该连接，让上层按连接失败重试，绝不丢字节。
+				log.Printf("[TUNNEL] dataCh full, closing conn (connID=%d, cap=%d), %d bytes dropped",
+					connID, cap(tc.ch), len(payload))
+				tunnelConnsMu.Lock()
+				if cur, exists := tunnelConns[connID]; exists && cur == tc {
+					delete(tunnelConns, connID)
 				}
+				tunnelConnsMu.Unlock()
+				tc.cancel()
 			}
 		case MsgTunnelDisconnect:
 			tunnelConnsMu.Lock()
-			if ch, ok := tunnelConns[connID]; ok {
-				close(ch)
+			tc, ok := tunnelConns[connID]
+			if ok {
 				delete(tunnelConns, connID)
 			}
 			tunnelConnsMu.Unlock()
+			if ok {
+				close(tc.ch)
+				tc.cancel()
+			}
 		case MsgTunnelUDPData:
 			// UDP 响应数据 - 转发到本地客户端
 			handleUDPResponse(payload)
@@ -526,12 +745,18 @@ func handleUDPResponse(payload []byte) {
 	}
 }
 
-func tunnelSend(dc *webrtc.DataChannel, prefix byte, connID uint16, payload []byte) {
+func tunnelSend(dc *webrtc.DataChannel, prefix byte, connID uint16, payload []byte) error {
+	if len(payload) > tunnelMaxPayload {
+		return fmt.Errorf("tunnel payload %d > %d (prefix=0x%02x connID=%d)", len(payload), tunnelMaxPayload, prefix, connID)
+	}
 	msg := make([]byte, 3+len(payload))
 	msg[0] = prefix
 	binary.BigEndian.PutUint16(msg[1:3], connID)
 	copy(msg[3:], payload)
-	dc.Send(msg)
+	if err := dc.Send(msg); err != nil {
+		return fmt.Errorf("dc send failed (prefix=0x%02x connID=%d len=%d): %w", prefix, connID, len(msg), err)
+	}
+	return nil
 }
 
 // connID分配器
@@ -556,18 +781,25 @@ var (
 	tunnelOKWaiters = make(map[uint16]chan bool)
 )
 
-func tunnelWaitOK(dc *webrtc.DataChannel, connID uint16, timeout time.Duration) (bool, error) {
+// registerTunnelOKWaiter 注册 ConnectOK 等待器。必须在发送 Connect 之前调用，
+// 否则对端极快返回的 OK 会先于注册到达而被丢弃，导致白等超时。
+// 返回等待通道与注销函数（调用方需 defer 注销）。
+func registerTunnelOKWaiter(connID uint16) (chan bool, func()) {
 	ch := make(chan bool, 1)
 	tunnelOKMu.Lock()
 	tunnelOKWaiters[connID] = ch
 	tunnelOKMu.Unlock()
 
-	defer func() {
+	return ch, func() {
 		tunnelOKMu.Lock()
-		delete(tunnelOKWaiters, connID)
+		if cur, ok := tunnelOKWaiters[connID]; ok && cur == ch {
+			delete(tunnelOKWaiters, connID)
+		}
 		tunnelOKMu.Unlock()
-	}()
+	}
+}
 
+func waitTunnelOK(ch chan bool, timeout time.Duration) (bool, error) {
 	select {
 	case ok := <-ch:
 		return ok, nil

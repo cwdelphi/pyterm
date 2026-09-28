@@ -104,3 +104,39 @@ class TestWebRTCSignaling:
                 })
                 resp = ws.receive_json()
                 assert resp["type"] == "register_failed"
+
+
+class TestWebtermAudit:
+    def test_webterm_open_audit(self):
+        """TC-W06: webterm 控制台打开留痕(N6)"""
+        resp = client.post(
+            "/api/webrtc/webterm-open",
+            json={"agent_id": _TEST_AGENT_ID, "agent_name": "API Test Agent"},
+            headers=_auth_headers(),
+        )
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+
+        from sqlalchemy import select
+        from app.database import AuditLog
+        from app.tests.sync_db import _make_sync_factories
+        engine, Session = _make_sync_factories()
+        with Session() as s:
+            row = s.execute(
+                select(AuditLog)
+                .where(AuditLog.action == "agent.webterm_open",
+                       AuditLog.target_id == _TEST_AGENT_ID)
+                .order_by(AuditLog.id.desc())
+            ).scalars().first()
+        engine.dispose()
+        assert row is not None
+        assert row.username == _WRTC_USER
+        assert row.target_type == "agent"
+
+    def test_webterm_open_no_token(self):
+        """TC-W06: 未认证访问被拒"""
+        resp = client.post(
+            "/api/webrtc/webterm-open",
+            json={"agent_id": _TEST_AGENT_ID, "agent_name": "x"},
+        )
+        assert resp.status_code in (401, 403)

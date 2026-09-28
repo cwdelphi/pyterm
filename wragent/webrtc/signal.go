@@ -12,13 +12,20 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/creack/pty"
 	"github.com/pion/webrtc/v4"
 	"github.com/pkg/sftp"
 	"github.com/ppy-tools/wragent/config"
 	"github.com/ppy-tools/wragent/logger"
+	"github.com/ppy-tools/wragent/plugin"
+	socks5plugin "github.com/ppy-tools/wragent/plugins/socks5"
+	speedtestplugin "github.com/ppy-tools/wragent/plugins/speedtest"
+	tunnelplugin "github.com/ppy-tools/wragent/plugins/tunnel"
 	ws "github.com/ppy-tools/wragent/websocket"
 	gossh "golang.org/x/crypto/ssh"
 )
@@ -148,6 +155,64 @@ type SignalHandler struct {
 	onAuthFailed      func()
 	onRegister        func()
 	onConnectSuccess  func(roomID string)
+	pluginMgr         *plugin.Manager
+	speedtestPlugin   *speedtestplugin.Plugin
+	speedtestCancels  map[string]chan struct{} // room -> 取消信号(speedtest_stop)
+}
+
+// getPluginManager 懒初始化插件管理器（配置消息在读循环串行处理，无竞态）
+func (h *SignalHandler) getPluginManager() *plugin.Manager {
+	if h.pluginMgr == nil {
+		m := plugin.NewManager(plugin.Deps{
+			Bridge: func(conn net.Conn, addr string, onResult func(ok bool)) {
+				bridgeTCPConn(conn, addr, h, onResult)
+			},
+			SendConnectTunnel: func(agentID string) error {
+				return h.client.SendConnectTunnel(agentID, h.client.Token())
+			},
+			SendSignal: h.sendSpeedtestSignal,
+		})
+		// 注册插件
+		if err := m.Register(tunnelplugin.New(tunnelplugin.Deps{
+			Reconcile: func(ts []config.TunnelConfig) {
+				if tunnelManager != nil {
+					tunnelManager.ReconcileTunnels(ts)
+				} else {
+					log.Printf("[TUNNEL] tunnelManager not initialized, skipping tunnel update")
+				}
+			},
+			Stop: func() {
+				if tunnelManager != nil {
+					tunnelManager.StopAll()
+				}
+			},
+			Status: func() (bool, string) {
+				if tunnelManager == nil {
+					return false, "not initialized"
+				}
+				n, detail := tunnelManager.Stats()
+				return n > 0, detail
+			},
+			SendConnectTunnel: func(agentID string) error {
+				return h.client.SendConnectTunnel(agentID, h.client.Token())
+			},
+		})); err != nil {
+			log.Printf("[PLUGIN] 注册 tunnel 失败: %v", err)
+		}
+		if err := m.Register(socks5plugin.New(m.Deps())); err != nil {
+			log.Printf("[PLUGIN] 注册 socks5 失败: %v", err)
+		}
+		sp := speedtestplugin.New(speedtestplugin.Deps{
+			SendSignal: h.sendSpeedtestSignal,
+			Logf:       func(format string, args ...any) { log.Printf(format, args...) },
+		})
+		if err := m.Register(sp); err != nil {
+			log.Printf("[PLUGIN] 注册 speedtest 失败: %v", err)
+		}
+		h.speedtestPlugin = sp
+		h.pluginMgr = m
+	}
+	return h.pluginMgr
 }
 
 // NewSignalHandler 创建信令处理器
@@ -156,6 +221,7 @@ func NewSignalHandler(client *ws.Client) *SignalHandler {
 		client:            client,
 		p:                 make(map[string]*Peer),
 		pendingCandidates: make(map[string][]webrtc.ICECandidateInit),
+		speedtestCancels:  make(map[string]chan struct{}),
 	}
 }
 
@@ -228,6 +294,12 @@ func (h *SignalHandler) handleMessage(msg *ws.Message) {
 		if h.onConnectSuccess != nil {
 			go h.onConnectSuccess(msg.RoomID)
 		}
+	case "speedtest_connect":
+		log.Printf("[SPEEDTEST] 收到测速指令, room: %s", msg.RoomID)
+		go h.startSpeedtest(msg)
+	case "speedtest_stop":
+		log.Printf("[SPEEDTEST] 收到测速停止, room: %s", msg.RoomID)
+		h.stopSpeedtest(msg.RoomID)
 	case "offer":
 		h.handleOffer(msg)
 	case "answer":
@@ -235,9 +307,249 @@ func (h *SignalHandler) handleMessage(msg *ws.Message) {
 	case "candidate":
 		h.handleCandidate(msg)
 	case "heartbeat_ack":
+	case "error":
+		detail := msg.Detail
+		if detail == "" {
+			detail = string(msg.Data)
+		}
+		log.Printf("[MD-ERROR] 服务端返回错误: %s", detail)
 	default:
 		log.Printf("未知消息类型: %s", msg.Type)
 	}
+}
+
+// sendSpeedtestSignal 插件 Deps.SendSignal: 完整 JSON(含 type/room_id)拆装 ws.Message 上报
+func (h *SignalHandler) sendSpeedtestSignal(payload []byte) error {
+	var probe struct {
+		Type   string `json:"type"`
+		RoomID string `json:"room_id"`
+	}
+	_ = json.Unmarshal(payload, &probe)
+	if probe.Type == "" {
+		return fmt.Errorf("speedtest payload missing type")
+	}
+	return h.client.Send(&ws.Message{Type: probe.Type, RoomID: probe.RoomID, Data: payload})
+}
+
+// sendSpeedtestError 向服务端/浏览器回报测速错误
+func (h *SignalHandler) sendSpeedtestError(roomID, detail string) {
+	raw, _ := json.Marshal(map[string]any{"type": "speedtest_error", "room_id": roomID, "detail": detail})
+	_ = h.sendSpeedtestSignal(raw)
+}
+
+// startSpeedtest 发起端编排: relay-only Peer + DC "speedtest" + 阶段1发送(阶段S)
+func (h *SignalHandler) startSpeedtest(msg *ws.Message) {
+	var req struct {
+		RoomID   string `json:"room_id"`
+		Duration int    `json:"duration"`
+		MBPS     int    `json:"mbps_limit"`
+	}
+	if err := json.Unmarshal(msg.Data, &req); err != nil || req.RoomID == "" {
+		log.Printf("[SPEEDTEST] 指令解析失败: %v", err)
+		return
+	}
+	if req.Duration <= 0 {
+		req.Duration = 10
+	}
+
+	serverICE := h.client.GetICEServers()
+	if len(serverICE) == 0 {
+		// relay 强制: 无服务端 ICE/TURN → 明确报错(md 侧已预检, 此处兜底)
+		h.sendSpeedtestError(req.RoomID, "需配置Coturn")
+		log.Printf("[SPEEDTEST] 无服务端TURN配置, 中止 room=%s", req.RoomID)
+		return
+	}
+	var iceServers []webrtc.ICEServer
+	for _, st := range serverICE {
+		iceServers = append(iceServers, webrtc.ICEServer{
+			URLs:       st.URLs,
+			Username:   st.Username,
+			Credential: st.Credential,
+		})
+	}
+	config := webrtc.Configuration{
+		ICEServers:         iceServers,
+		ICETransportPolicy: webrtc.ICETransportPolicyRelay,
+	}
+	peer, err := NewPeer(h.client.AgentID(), config)
+	if err != nil {
+		h.sendSpeedtestError(req.RoomID, err.Error())
+		return
+	}
+
+	h.mu.Lock()
+	if oldPeer, exists := h.p[req.RoomID]; exists {
+		oldPeer.Close()
+	}
+	h.p[req.RoomID] = peer
+	cancel := make(chan struct{})
+	if oldCancel, exists := h.speedtestCancels[req.RoomID]; exists {
+		close(oldCancel)
+	}
+	h.speedtestCancels[req.RoomID] = cancel
+	h.mu.Unlock()
+
+	peer.OnICECandidate(func(candidate *webrtc.ICECandidate) {
+		if candidate == nil {
+			return
+		}
+		candidateJSON := candidate.ToJSON()
+		h.sendCandidate(&candidateJSON, req.RoomID)
+	})
+
+	dc, err := peer.CreateDataChannel("speedtest", true)
+	if err != nil {
+		h.sendSpeedtestError(req.RoomID, err.Error())
+		h.cleanupSpeedtestRoom(req.RoomID, peer, cancel)
+		return
+	}
+	var recvBytes uint64
+	var recvMu sync.Mutex
+	dc.OnMessage(func(m webrtc.DataChannelMessage) {
+		if len(m.Data) > 0 && m.Data[0] == 0x61 {
+			recvMu.Lock()
+			recvBytes += uint64(len(m.Data) - 1)
+			recvMu.Unlock()
+		}
+	})
+	dc.OnOpen(func() {
+		log.Printf("[SPEEDTEST] DataChannel 已打开, 开始测速 room=%s limit=%dMbps", req.RoomID, req.MBPS)
+		h.runSpeedtestSource(dc, peer, cancel, &recvMu, &recvBytes, req.RoomID, req.Duration, req.MBPS)
+	})
+
+	offer, err := peer.CreateOffer()
+	if err != nil {
+		h.sendSpeedtestError(req.RoomID, err.Error())
+		h.cleanupSpeedtestRoom(req.RoomID, peer, cancel)
+		return
+	}
+	h.sendOffer(offer, req.RoomID)
+	log.Printf("[SPEEDTEST] Offer已发送 room=%s (relay-only)", req.RoomID)
+}
+
+// runSpeedtestSource 阶段1 上行发送 → 通知阶段2 → 等待+收尾
+func (h *SignalHandler) runSpeedtestSource(dc *webrtc.DataChannel, peer *Peer, cancel chan struct{},
+	recvMu *sync.Mutex, recvBytes *uint64, roomID string, duration, mbps int) {
+	defer h.cleanupSpeedtestRoom(roomID, peer, cancel)
+
+	sendCtrl := func(t string, dur, limit int) {
+		raw, _ := json.Marshal(map[string]any{"t": t, "room": roomID, "duration": dur, "mbps": limit})
+		if err := dc.Send(append([]byte{0x60}, raw...)); err != nil {
+			log.Printf("[SPEEDTEST] ctrl %s 发送失败: %v", t, err)
+		}
+	}
+
+	sendCtrl("start", duration, mbps)
+	speedtestSendLoop(dc, duration, mbps, cancel)
+	sendCtrl("down", duration, mbps)
+
+	// 阶段2: 接收目标发送的下行数据(硬时限+1s grace 等 result 经信令上报)
+	deadline := time.After(time.Duration(duration)*time.Second + time.Second)
+	for {
+		select {
+		case <-cancel:
+			log.Printf("[SPEEDTEST] 已取消 room=%s", roomID)
+			return
+		case <-deadline:
+			recvMu.Lock()
+			log.Printf("[SPEEDTEST] 发起端收尾 room=%s 阶段2收到=%dB", roomID, *recvBytes)
+			recvMu.Unlock()
+			return
+		}
+	}
+}
+
+// speedtestSendLoop 阶段1 上行发送: 限速档 + 背压 + 硬时限
+func speedtestSendLoop(dc *webrtc.DataChannel, duration, mbps int, stop <-chan struct{}) {
+	deadline := time.Now().Add(time.Duration(duration) * time.Second)
+	frame := make([]byte, 1+16*1024)
+	frame[0] = 0x61
+	for time.Now().Before(deadline) {
+		select {
+		case <-stop:
+			return
+		default:
+		}
+		for dc.BufferedAmount() > 64*1024 && time.Now().Before(deadline) {
+			select {
+			case <-stop:
+				return
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+		if err := dc.Send(frame); err != nil {
+			log.Printf("[SPEEDTEST] 阶段1发送失败: %v", err)
+			return
+		}
+		if mbps > 0 {
+			interval := time.Duration(float64(len(frame)) / (float64(mbps) * 1e6 / 8) * float64(time.Second))
+			if interval > 0 {
+				select {
+				case <-stop:
+					return
+				case <-time.After(interval):
+				}
+			}
+		}
+	}
+}
+
+// cleanupSpeedtestRoom 关闭 Peer 并清理房间注册与取消信号(幂等)
+func (h *SignalHandler) cleanupSpeedtestRoom(roomID string, peer *Peer, cancel chan struct{}) {
+	peer.Close()
+	h.mu.Lock()
+	if h.p[roomID] == peer {
+		delete(h.p, roomID)
+	}
+	if c, ok := h.speedtestCancels[roomID]; ok && c == cancel {
+		delete(h.speedtestCancels, roomID)
+	}
+	h.mu.Unlock()
+}
+
+// stopSpeedtest speedtest_stop: 关发送循环/关 Peer/复位插件会话
+func (h *SignalHandler) stopSpeedtest(roomID string) {
+	h.mu.Lock()
+	if c, ok := h.speedtestCancels[roomID]; ok {
+		close(c)
+		delete(h.speedtestCancels, roomID)
+	}
+	peer, hasPeer := h.p[roomID]
+	delete(h.p, roomID)
+	h.mu.Unlock()
+	if hasPeer {
+		peer.Close()
+	}
+	if h.speedtestPlugin != nil {
+		h.speedtestPlugin.Reset()
+	}
+}
+
+// attachSpeedtestDC 接收端 DC 挂载: 帧分发给 speedtest 插件(同步, 防首帧丢失)
+func (h *SignalHandler) attachSpeedtestDC(dc *webrtc.DataChannel, roomID string) {
+	log.Printf("[SPEEDTEST] 接收端DataChannel打开 (room=%s)", roomID)
+	mgr := h.getPluginManager()
+	if h.speedtestPlugin != nil {
+		h.speedtestPlugin.AttachSender(roomID,
+			func(b []byte) error { return dc.Send(b) },
+			func() uint64 { return dc.BufferedAmount() })
+	}
+	dc.OnMessage(func(m webrtc.DataChannelMessage) {
+		if len(m.Data) == 0 {
+			return
+		}
+		switch m.Data[0] {
+		case 0x60:
+			mgr.Dispatch("speedtest", "ctrl", m.Data[1:])
+		case 0x61:
+			mgr.Dispatch("speedtest", "data", m.Data[1:])
+		}
+	})
+	dc.OnClose(func() {
+		if h.speedtestPlugin != nil {
+			h.speedtestPlugin.Detach(roomID)
+		}
+	})
 }
 
 // CreateTunnelPeer 隧道模式：主动创建 Peer + DataChannel + Offer
@@ -275,6 +587,7 @@ func (h *SignalHandler) CreateTunnelPeer(roomID string) {
 			return
 		}
 		candidateJSON := candidate.ToJSON()
+		log.Printf("[ICE-DIAG] local candidate room=%s: %s", roomID, candidateJSON.Candidate)
 		h.sendCandidate(&candidateJSON, roomID)
 	})
 
@@ -356,6 +669,11 @@ func (h *SignalHandler) handleOffer(msg *ws.Message) {
 	}
 
 	config := webrtc.Configuration{ICEServers: iceServers}
+	if strings.HasPrefix(roomID, "speedtest_") {
+		// 测速: 双端 relay-only(强制走 TURN, md 侧已校验 coturn 可用)
+		config.ICETransportPolicy = webrtc.ICETransportPolicyRelay
+		log.Printf("[SPEEDTEST] relay-only peer (room=%s)", roomID)
+	}
 
 	peer, err := NewPeer(h.client.AgentID(), config)
 	if err != nil {
@@ -376,6 +694,7 @@ func (h *SignalHandler) handleOffer(msg *ws.Message) {
 			return
 		}
 		candidateJSON := candidate.ToJSON()
+		log.Printf("[ICE-DIAG] local candidate room=%s: %s", roomID, candidateJSON.Candidate)
 		h.sendCandidate(&candidateJSON, roomID)
 	})
 
@@ -388,8 +707,14 @@ func (h *SignalHandler) handleOffer(msg *ws.Message) {
 			return
 		}
 		if name == "tcp-tunnel" {
-			RegisterTunnelDC(dc)
+			// bridgeTCPTunnel 内部通过 registerTunnelDC 一次性挂好
+			// OnMessage/OnClose（pion 单槽，重复注册会互相覆盖）
 			h.bridgeTCPTunnel(dc, roomID)
+			return
+		}
+		if name == "speedtest" {
+			// 测速接收端: 同步挂 OnMessage(防首帧丢失), 分发给 speedtest 插件
+			h.attachSpeedtestDC(dc, roomID)
 			return
 		}
 		if h.onReady != nil {
@@ -456,7 +781,11 @@ func (h *SignalHandler) handleCandidate(msg *ws.Message) {
 	peer, ok := h.p[roomID]
 	h.mu.RUnlock()
 	if !ok || peer == nil {
-		log.Printf("收到ICE候选但Peer不存在 room=%s", roomID)
+		candRaw := msg.Data
+		if len(candRaw) == 0 {
+			candRaw = msg.Candidate
+		}
+		log.Printf("收到ICE候选但Peer不存在 room=%s (dropped): %s", roomID, string(candRaw))
 		return
 	}
 	var candidate webrtc.ICECandidateInit
@@ -468,8 +797,10 @@ func (h *SignalHandler) handleCandidate(msg *ws.Message) {
 		log.Printf("解析ICE候选失败: %v", err)
 		return
 	}
+	log.Printf("[ICE-DIAG] remote candidate room=%s: %s", roomID, candidate.Candidate)
 	if err := peer.AddICECandidate(candidate); err != nil {
 		// remote description 未设置时缓冲候选
+		log.Printf("[ICE-DIAG] remote candidate buffered room=%s (remote desc not set)", roomID)
 		h.mu.Lock()
 		h.pendingCandidates[roomID] = append(h.pendingCandidates[roomID], candidate)
 		h.mu.Unlock()
@@ -542,27 +873,14 @@ func (h *SignalHandler) handleConfigUpdate(data json.RawMessage) {
 		logger.SetLevel(serverCfg.LogLevel)
 	}
 
-	// 热更新隧道
-	if tunnelManager != nil {
-		tunnelManager.ReconcileTunnels(serverCfg.Tunnels)
-		// 为每个有目标Agent的隧道发送connect_tunnel，建立WebRTC DataChannel
-		for _, t := range serverCfg.Tunnels {
-			if t.Enabled && t.TargetAgentID != "" {
-				if err := h.client.SendConnectTunnel(t.TargetAgentID, h.client.Token()); err != nil {
-					log.Printf("[TUNNEL] connect_tunnel to %s failed: %v", t.TargetAgentID, err)
-				} else {
-					log.Printf("[TUNNEL] connect_tunnel sent to %s for tunnel %s", t.TargetAgentID, t.ID)
-				}
-			}
-		}
-	} else {
-		log.Printf("tunnelManager not initialized, skipping tunnel update")
-	}
+	// 插件分发(阶段D): normalize 双通路 → Manager 串行 Reconcile 为唯一入口;
+	// tunnel/socks5 插件各自接管监听, 顶层 tunnels 镜像仅旧Agent读取, 本地不再直驱。
+	h.getPluginManager().Reconcile(serverCfg.NormalizePlugins())
 
 	// 发送确认
 	h.sendConfigUpdateAck()
-	log.Printf("配置热更新完成: reconnect=%ds heartbeat=%ds log_level=%s tunnels=%d",
-		serverCfg.WSReconnectInterval, serverCfg.WSHeartbeatInterval, logger.GetLevel(), len(serverCfg.Tunnels))
+	log.Printf("配置热更新完成: reconnect=%ds heartbeat=%ds log_level=%s tunnels=%d plugins=%d",
+		serverCfg.WSReconnectInterval, serverCfg.WSHeartbeatInterval, logger.GetLevel(), len(serverCfg.Tunnels), len(serverCfg.Plugins))
 }
 
 // sendConfigUpdateAck 发送配置更新确认
@@ -667,6 +985,13 @@ func (h *SignalHandler) handleUpgrade(data json.RawMessage) {
 	restartSelf()
 }
 
+// StopPlugins 进程退出前优雅停止全部插件监听(tunnel/socks5, 阶段D 接 main)
+func (h *SignalHandler) StopPlugins() {
+	if h.pluginMgr != nil {
+		h.pluginMgr.StopAll()
+	}
+}
+
 func (h *SignalHandler) Close() {
 	h.mu.Lock()
 	for id, p := range h.p {
@@ -723,6 +1048,7 @@ type SSHConnectMsg struct {
 	Password string `json:"password"`
 	Cols     int    `json:"cols"`
 	Rows     int    `json:"rows"`
+	Mode     string `json:"mode"` // "local"=webterm 本地shell(免SSH服务)
 }
 
 type ResizeMsg struct {
@@ -730,12 +1056,14 @@ type ResizeMsg struct {
 	Rows int `json:"rows"`
 }
 
-// sshSession 保存 SSH 会话状态
+// sshSession 保存 SSH 会话状态(webterm: sshConn/session 为 nil, pty/cmd 生效)
 type sshSession struct {
 	dc      *webrtc.DataChannel
 	sshConn *gossh.Client
 	session *gossh.Session
 	stdin   interface{ Write([]byte) (int, error) }
+	pty     *os.File  // webterm 本地 PTY(creack/pty)
+	cmd     *exec.Cmd // webterm shell 进程
 }
 
 // vncSession 保存 VNC 桥接状态
@@ -1107,10 +1435,8 @@ func (h *SignalHandler) bridgeSSHToDataChannel(dc *webrtc.DataChannel, roomID st
 		case MsgAck:
 			h.handleTerminalAck(dc, payload)
 		case MsgSSHConnect:
-			// 已有会话时收到新连接指令 → 关闭旧会话后重建 (R6 幂等重连)
-			if sess.session != nil {
-				sess.session.Close()
-			}
+			// 已有会话时收到新连接指令 → 关闭旧会话后重建 (R6 幂等重连, SSH/webterm 通用)
+			closeSSHSession(sess)
 			var connectMsg SSHConnectMsg
 			if err := json.Unmarshal(payload, &connectMsg); err != nil {
 				h.sendDCErrorMsg(dc, "SSH连接指令解析失败: "+err.Error())
@@ -1124,12 +1450,26 @@ func (h *SignalHandler) bridgeSSHToDataChannel(dc *webrtc.DataChannel, roomID st
 		case MsgResize:
 			// P9: window-change 必须发到带 PTY 的原会话，不能新开 Session
 			var resize ResizeMsg
-			if json.Unmarshal(payload, &resize) == nil && sess.session != nil {
+			if json.Unmarshal(payload, &resize) != nil {
+				break
+			}
+			if sess.session != nil {
 				if err := sess.session.WindowChange(resize.Rows, resize.Cols); err != nil {
 					log.Printf("WindowChange failed room=%s: %v", roomID, err)
 				}
+			} else if sess.pty != nil {
+				// webterm: TIOCSWINSZ 直改本地 PTY
+				if err := pty.Setsize(sess.pty, &pty.Winsize{Rows: uint16(resize.Rows), Cols: uint16(resize.Cols)}); err != nil {
+					log.Printf("[WEBTERM] Setsize failed room=%s: %v", roomID, err)
+				}
 			}
 		case MsgSFTPRequest:
+			// 分片请求（大文件写入）必须同步入缓冲：若与请求 goroutine 并发，
+			// 分片可能晚于请求落盘导致装配失败
+			if meta := parseSFTPWireMeta(payload); meta != nil && meta.Chunk != nil {
+				storeSFTPChunk(meta)
+				break
+			}
 			if sess.sshConn != nil {
 				sshConnRef := sess.sshConn
 				go h.handleSFTPData(dc, payload, sshConnRef)
@@ -1153,9 +1493,7 @@ func (h *SignalHandler) bridgeSSHToDataChannel(dc *webrtc.DataChannel, roomID st
 			vnc = nil
 		}
 		if sess != nil {
-			if sess.session != nil {
-				sess.session.Close()
-			}
+			closeSSHSession(sess)
 			sess = nil
 		}
 	})
@@ -1197,6 +1535,10 @@ func (h *SignalHandler) reportVNCError(dc *webrtc.DataChannel, stage string, err
 
 // connectSSH 建立 SSH 连接并启动桥接
 func (h *SignalHandler) connectSSH(dc *webrtc.DataChannel, connectMsg *SSHConnectMsg, roomID string) *sshSession {
+	// webterm: mode=local → Agent 本地 shell, 不拨号 SSH(内嵌SSH服务已移除)
+	if connectMsg.Mode == "local" {
+		return h.connectLocal(dc, connectMsg, roomID)
+	}
 	sSHStart := time.Now()
 	addr := fmt.Sprintf("%s:%d", connectMsg.Host, connectMsg.Port)
 	log.Printf("收到SSH连接指令: %s@%s (room=%s)", connectMsg.Username, addr, roomID)
@@ -1337,6 +1679,132 @@ func (h *SignalHandler) connectSSH(dc *webrtc.DataChannel, connectMsg *SSHConnec
 	return &sshSession{dc: dc, sshConn: sshConn, session: session, stdin: stdin}
 }
 
+// ── DC 消息分片 ──────────────────────────────────────────────
+// WebRTC DataChannel 单条消息上限 65536 字节（pion 与浏览器 SCTP 一致），
+// 超过即被 pion 拒绝（outbound packet larger than maximum message size），
+// 因此 SFTP 读写响应/请求超过阈值时按分片发送，接收端按 req_id 重组。
+const dcSFTPSingleLimit = 32 * 1024 // 小于该值直接单条发送
+const dcSFTPChunkSize = 24 * 1024   // 分片原始字节数（base64 后 32KB + 信封 < 64KB）
+
+type sftpChunkWire struct {
+	ReqID  string `json:"req_id"`
+	Chunks int    `json:"chunks"`
+	Chunk  *struct {
+		I    int    `json:"i"`
+		N    int    `json:"n"`
+		Data string `json:"data"`
+	} `json:"chunk"`
+}
+
+var (
+	sftpChunkMu   sync.Mutex
+	sftpChunkBuf  = map[string]map[int][]byte{}
+	sftpChunkN    = map[string]int{}
+	sftpChunkSeen = map[string]time.Time{}
+)
+
+func parseSFTPWireMeta(payload []byte) *sftpChunkWire {
+	var w sftpChunkWire
+	if err := json.Unmarshal(payload, &w); err != nil {
+		return nil
+	}
+	return &w
+}
+
+func storeSFTPChunk(w *sftpChunkWire) {
+	if w.Chunk == nil || w.ReqID == "" || w.Chunk.N <= 0 || w.Chunk.I < 0 || w.Chunk.I >= w.Chunk.N {
+		return
+	}
+	raw, err := base64.StdEncoding.DecodeString(w.Chunk.Data)
+	if err != nil {
+		log.Printf("[A-BRIDGE] sftp chunk base64 decode error req=%s: %v", w.ReqID, err)
+		return
+	}
+	now := time.Now()
+	sftpChunkMu.Lock()
+	defer sftpChunkMu.Unlock()
+	for id, ts := range sftpChunkSeen {
+		if now.Sub(ts) > 60*time.Second {
+			delete(sftpChunkBuf, id)
+			delete(sftpChunkN, id)
+			delete(sftpChunkSeen, id)
+		}
+	}
+	parts, ok := sftpChunkBuf[w.ReqID]
+	if !ok {
+		parts = map[int][]byte{}
+		sftpChunkBuf[w.ReqID] = parts
+		sftpChunkN[w.ReqID] = w.Chunk.N
+	}
+	if len(parts) >= w.Chunk.N {
+		return
+	}
+	parts[w.Chunk.I] = raw
+	sftpChunkSeen[w.ReqID] = now
+}
+
+// takeSFTPChunks 取出并拼装完整分片；DC 为有序通道，分片必然先于请求到达
+func takeSFTPChunks(reqID string, n int) ([]byte, bool) {
+	sftpChunkMu.Lock()
+	defer sftpChunkMu.Unlock()
+	parts, ok := sftpChunkBuf[reqID]
+	if !ok || sftpChunkN[reqID] != n || len(parts) != n {
+		return nil, false
+	}
+	var total int
+	for i := 0; i < n; i++ {
+		p, ok := parts[i]
+		if !ok {
+			return nil, false
+		}
+		total += len(p)
+	}
+	out := make([]byte, 0, total)
+	for i := 0; i < n; i++ {
+		out = append(out, parts[i]...)
+	}
+	delete(sftpChunkBuf, reqID)
+	delete(sftpChunkN, reqID)
+	delete(sftpChunkSeen, reqID)
+	return out, true
+}
+
+// sendSFTPJSON 发送 SFTP 响应：超过单条上限时自动分片
+func (h *SignalHandler) sendSFTPJSON(dc *webrtc.DataChannel, reqID string, payload []byte) {
+	if len(payload) <= dcSFTPSingleLimit {
+		h.sendDCMsg(dc, MsgSFTPResponse, payload)
+		return
+	}
+	n := (len(payload) + dcSFTPChunkSize - 1) / dcSFTPChunkSize
+	start := time.Now()
+	for i := 0; i < n; i++ {
+		s := i * dcSFTPChunkSize
+		e := s + dcSFTPChunkSize
+		if e > len(payload) {
+			e = len(payload)
+		}
+		env := map[string]interface{}{
+			"type":   "sftp",
+			"req_id": reqID,
+			"chunk": map[string]interface{}{
+				"i":    i,
+				"n":    n,
+				"data": base64.StdEncoding.EncodeToString(payload[s:e]),
+			},
+		}
+		b, err := json.Marshal(env)
+		if err != nil {
+			return
+		}
+		if err := h.sendDCMsg(dc, MsgSFTPResponse, b); err != nil {
+			log.Printf("[A-BRIDGE] SFTP chunk %d/%d send error req=%s: %v", i+1, n, reqID, err)
+			return
+		}
+	}
+	log.Printf("[A-BRIDGE] SFTP chunked response sent: chunks=%d req=%s elapsed=%dms buffered=%d",
+		n, reqID, time.Since(start).Milliseconds(), dc.BufferedAmount())
+}
+
 type SFTPRequestMsg struct {
 	Type    string `json:"type"`
 	Op      string `json:"op"`
@@ -1345,6 +1813,7 @@ type SFTPRequestMsg struct {
 	Content string `json:"content,omitempty"`
 	OldPath string `json:"old_path,omitempty"`
 	NewName string `json:"new_name,omitempty"`
+	Chunks  int    `json:"chunks,omitempty"`
 }
 
 type SftpItem struct {
@@ -1370,7 +1839,7 @@ func (h *SignalHandler) sendDCSftpResponse(dc *webrtc.DataChannel, reqID, op, pa
 		resp["content"] = content
 	}
 	data, _ := json.Marshal(resp)
-	h.sendDCMsg(dc, MsgSFTPResponse, data)
+	h.sendSFTPJSON(dc, reqID, data)
 }
 
 func (h *SignalHandler) sendDCSftpOk(dc *webrtc.DataChannel, reqID, op string) {
@@ -1381,7 +1850,7 @@ func (h *SignalHandler) sendDCSftpOk(dc *webrtc.DataChannel, reqID, op string) {
 		"ok":     true,
 	}
 	data, _ := json.Marshal(resp)
-	h.sendDCMsg(dc, MsgSFTPResponse, data)
+	h.sendSFTPJSON(dc, reqID, data)
 }
 
 func (h *SignalHandler) sendDCSftpError(dc *webrtc.DataChannel, reqID, detail string) {
@@ -1392,7 +1861,7 @@ func (h *SignalHandler) sendDCSftpError(dc *webrtc.DataChannel, reqID, detail st
 		"detail": detail,
 	}
 	data, _ := json.Marshal(resp)
-	h.sendDCMsg(dc, MsgSFTPResponse, data)
+	h.sendSFTPJSON(dc, reqID, data)
 }
 
 // sendWSDiagnostics 通过 WebSocket 信令通道回传诊断数据（DC 发送失败时的备用路径）
@@ -1416,6 +1885,19 @@ func (h *SignalHandler) handleSFTPData(dc *webrtc.DataChannel, data []byte, sshC
 	if err := json.Unmarshal(data, &req); err != nil {
 		h.sendDCSftpError(dc, "", "SFTP请求解析失败: "+err.Error())
 		return
+	}
+
+	// 分片请求（大文件写入）：重组完整 JSON 后再解析
+	if req.Chunks > 0 {
+		raw, ok := takeSFTPChunks(req.ReqID, req.Chunks)
+		if !ok {
+			h.sendDCSftpError(dc, req.ReqID, fmt.Sprintf("分片数据不完整 (期望 %d 片)", req.Chunks))
+			return
+		}
+		if err := json.Unmarshal(raw, &req); err != nil {
+			h.sendDCSftpError(dc, req.ReqID, "分片数据解析失败: "+err.Error())
+			return
+		}
 	}
 
 	client, err := sftp.NewClient(sshConn)
@@ -1568,7 +2050,10 @@ func (h *SignalHandler) bridgeVNC(ctx context.Context, dc *webrtc.DataChannel, r
 	// TCP -> DataChannel (VNC server responses to browser)
 	go func() {
 		defer close(done)
-		buf := make([]byte, 64*1024)
+		// 读缓冲须保证 1 字节前缀 + n ≤ 65535（pion 接收侧读缓冲上限），
+		// 64KB 满读会得到 65537 字节消息：发送侧报 ErrOutboundPacketTooLarge，
+		// 且对端接收会因超限关闭 DataChannel。
+		buf := make([]byte, 60*1024)
 		for {
 			// 背压：DC 缓冲/待发队列高时暂停读 TCP，让 VNC 服务端降速（防丢帧）
 			if !h.waitVCNSendCapacity(ctx, dc) {
@@ -1658,22 +2143,19 @@ func (h *SignalHandler) waitVCNSendCapacity(ctx context.Context, dc *webrtc.Data
 	}
 }
 
-// bridgeTCPTunnel 处理来自隧道Listener的DataChannel，桥接到本地TCP连接
+// bridgeTCPTunnel 处理来自隧道Listener的DataChannel，桥接到本地TCP连接。
+// 桥接端的 OnMessage/OnClose 与监听端路由合并注册（registerTunnelDC），
+// 避免 pion 单槽回调互相覆盖导致先注册方失效。
 func (h *SignalHandler) bridgeTCPTunnel(dc *webrtc.DataChannel, roomID string) {
 	log.Printf("[TUNNEL-BRIDGE] tcp-tunnel DataChannel opened (room=%s)", roomID)
 
 	conns := make(map[uint16]net.Conn)
 	var mu sync.Mutex
 
-	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-		data := msg.Data
-		if len(data) < 3 {
-			return
-		}
-		prefix := data[0]
-		connID := uint16(data[1])<<8 | uint16(data[2])
-		payload := data[3:]
-
+	// 桥接端消息路由：返回 true 表示已消费。
+	// Connect/Data/Disconnect 由桥接端独占（connID 由对端 Listener 分配），
+	// 其余前缀（ConnectOK/UDPData）交回监听端路由处理。
+	handleMsg := func(prefix byte, connID uint16, payload []byte) bool {
 		switch prefix {
 		case MsgTunnelConnect:
 			// Listener请求建立TCP连接
@@ -1684,7 +2166,7 @@ func (h *SignalHandler) bridgeTCPTunnel(dc *webrtc.DataChannel, roomID string) {
 			if err := json.Unmarshal(payload, &req); err != nil {
 				log.Printf("[TUNNEL-BRIDGE] 解析连接请求失败: %v", err)
 				h.sendTunnelConnectOK(dc, connID, false, "解析失败")
-				return
+				return true
 			}
 			addr := fmt.Sprintf("%s:%d", req.Host, req.Port)
 			log.Printf("[TUNNEL-BRIDGE] 建立TCP连接: %s (connID=%d, room=%s)", addr, connID, roomID)
@@ -1693,7 +2175,7 @@ func (h *SignalHandler) bridgeTCPTunnel(dc *webrtc.DataChannel, roomID string) {
 			if err != nil {
 				log.Printf("[TUNNEL-BRIDGE] TCP连接失败: %v (connID=%d)", err, connID)
 				h.sendTunnelConnectOK(dc, connID, false, err.Error())
-				return
+				return true
 			}
 
 			mu.Lock()
@@ -1710,31 +2192,57 @@ func (h *SignalHandler) bridgeTCPTunnel(dc *webrtc.DataChannel, roomID string) {
 					delete(conns, connID)
 					mu.Unlock()
 					conn.Close()
-					h.sendTunnelMsg(dc, MsgTunnelDisconnect, connID, nil)
+					if err := h.sendTunnelMsg(dc, MsgTunnelDisconnect, connID, nil); err != nil {
+						log.Printf("[TUNNEL-BRIDGE] send Disconnect failed: %s (connID=%d)", err, connID)
+					}
 					log.Printf("[TUNNEL-BRIDGE] TCP连接关闭: %s (connID=%d)", addr, connID)
 				}()
-				buf := make([]byte, 65536)
+				buf := make([]byte, tunnelMaxPayload)
 				for {
+					// 背压：DC 发送缓冲超阈值时暂停读本地 TCP，避免无界堆积
+					if !waitTunnelSendCapacity(dc) {
+						log.Printf("[TUNNEL-BRIDGE] backpressure timeout/unavailable, closing TCP (connID=%d)", connID)
+						return
+					}
 					n, err := conn.Read(buf)
 					if n > 0 {
-						h.sendTunnelMsg(dc, MsgTunnelData, connID, buf[:n])
+						if sendErr := h.sendTunnelMsg(dc, MsgTunnelData, connID, buf[:n]); sendErr != nil {
+							// 发送失败说明字节已丢失，继续转发会造成流错位，直接断开
+							log.Printf("[TUNNEL-BRIDGE] send Data failed: %s, closing TCP (connID=%d)", sendErr, connID)
+							return
+						}
 					}
 					if err != nil {
 						return
 					}
 				}
 			}()
+			return true
 
 		case MsgTunnelData:
 			// DataChannel → TCP
 			mu.Lock()
 			conn, ok := conns[connID]
 			mu.Unlock()
-			if ok && len(payload) > 0 {
+			if !ok {
+				log.Printf("[TUNNEL-BRIDGE] data for unknown conn (connID=%d, %d bytes), dropped", connID, len(payload))
+				return true
+			}
+			if len(payload) > 0 {
 				if _, err := conn.Write(payload); err != nil {
-					log.Printf("[TUNNEL-BRIDGE] TCP写入失败: %v (connID=%d)", err, connID)
+					log.Printf("[TUNNEL-BRIDGE] TCP写入失败: %v (connID=%d), closing", err, connID)
+					mu.Lock()
+					if cur, exists := conns[connID]; exists && cur == conn {
+						delete(conns, connID)
+					}
+					mu.Unlock()
+					conn.Close()
+					if sendErr := h.sendTunnelMsg(dc, MsgTunnelDisconnect, connID, nil); sendErr != nil {
+						log.Printf("[TUNNEL-BRIDGE] send Disconnect failed: %s (connID=%d)", sendErr, connID)
+					}
 				}
 			}
+			return true
 
 		case MsgTunnelDisconnect:
 			// Listener关闭TCP连接
@@ -1748,10 +2256,12 @@ func (h *SignalHandler) bridgeTCPTunnel(dc *webrtc.DataChannel, roomID string) {
 				conn.Close()
 				log.Printf("[TUNNEL-BRIDGE] 收到断开通知，关闭TCP (connID=%d)", connID)
 			}
+			return true
 		}
-	})
+		return false
+	}
 
-	dc.OnClose(func() {
+	handleClose := func() {
 		log.Printf("[TUNNEL-BRIDGE] DataChannel关闭 (room=%s)", roomID)
 		mu.Lock()
 		for connID, conn := range conns {
@@ -1759,19 +2269,31 @@ func (h *SignalHandler) bridgeTCPTunnel(dc *webrtc.DataChannel, roomID string) {
 			delete(conns, connID)
 		}
 		mu.Unlock()
-	})
+	}
+
+	registerTunnelDC(dc, handleMsg, handleClose)
 }
 
 func (h *SignalHandler) sendTunnelConnectOK(dc *webrtc.DataChannel, connID uint16, ok bool, detail string) {
 	payload, _ := json.Marshal(map[string]interface{}{"ok": ok, "detail": detail})
-	h.sendTunnelMsg(dc, MsgTunnelConnectOK, connID, payload)
+	if err := h.sendTunnelMsg(dc, MsgTunnelConnectOK, connID, payload); err != nil {
+		log.Printf("[TUNNEL-BRIDGE] send ConnectOK failed: %s (connID=%d)", err, connID)
+	}
 }
 
-func (h *SignalHandler) sendTunnelMsg(dc *webrtc.DataChannel, prefix byte, connID uint16, payload []byte) {
+// sendTunnelMsg 发送隧道消息。返回错误时字节已丢失，调用方必须断开对应桥接，
+// 绝不能静默继续（会导致字节流错位，如 TLS net::ERR_SSL_PROTOCOL_ERROR）。
+func (h *SignalHandler) sendTunnelMsg(dc *webrtc.DataChannel, prefix byte, connID uint16, payload []byte) error {
+	if len(payload) > tunnelMaxPayload {
+		return fmt.Errorf("tunnel payload %d > %d (prefix=0x%02x connID=%d)", len(payload), tunnelMaxPayload, prefix, connID)
+	}
 	msg := make([]byte, 3+len(payload))
 	msg[0] = prefix
 	msg[1] = byte(connID >> 8)
 	msg[2] = byte(connID)
 	copy(msg[3:], payload)
-	dc.Send(msg)
+	if err := dc.Send(msg); err != nil {
+		return fmt.Errorf("dc send failed (prefix=0x%02x connID=%d len=%d): %w", prefix, connID, len(msg), err)
+	}
+	return nil
 }

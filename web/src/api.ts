@@ -55,6 +55,8 @@ export interface SshConn {
   rdp_resolution?: string
   has_password?: boolean
   sort_order?: number
+  // webterm: "local"=Agent 本地shell 控制台(免SSH服务)
+  mode?: 'local'
 }
 
 export interface SftpConfig {
@@ -82,13 +84,20 @@ export interface User {
 export interface TunnelConfig {
   id: string
   name: string
-  protocol: 'tcp' | 'udp'
+  protocol: 'tcp' | 'udp' | 'socks5'
   local_port: number
   target_addr?: string
   target_host?: string
   target_port?: string
   target_agent_id: string
   enabled: boolean
+  socks_username?: string
+  socks_password?: string
+}
+
+export interface AgentPluginsConfig {
+  tunnel?: { tunnels: TunnelConfig[] }
+  socks5?: { tunnels: TunnelConfig[] }
 }
 
 export interface AgentConfig {
@@ -97,6 +106,15 @@ export interface AgentConfig {
   ice_cooldown: number
   log_level: string
   tunnels: TunnelConfig[]
+  plugins?: AgentPluginsConfig
+}
+
+export interface AgentConfigPayload {
+  ws_reconnect_interval: number
+  ws_heartbeat_interval: number
+  ice_cooldown: number
+  log_level: string
+  plugins: AgentPluginsConfig
 }
 
 export interface AuditLog {
@@ -284,6 +302,12 @@ export const api = {
   sshDelete: (id: string) => postJSON('/api/ssh/delete', { id }),
   sshTest: (conn: Omit<SshConn, 'id' | 'name' | 'remark'>) => postJSON('/api/ssh/test', conn),
   sshReorder: (items: { id: string | undefined; sort_order: number }[]) => postJSON('/api/ssh/reorder', items),
+  // webterm 打开审计(N6: 可见即有 shell 权限, 打开动作留痕)
+  auditWebtermOpen: (agentId: string, agentName: string) =>
+    postJSON('/api/webrtc/webterm-open', { agent_id: agentId, agent_name: agentName }),
+  // Agent↔Agent 测速历史(阶段S)
+  speedtestHistory: (): Promise<{ history: Array<{ source: string; target: string; up_mbps: number; down_mbps: number; duration: number; finished_at: number }> }> =>
+    getJSON('/api/webrtc/speedtest/history'),
 
   /* ── SFTP 服务 ── */
   sftpConfig: (): Promise<SftpConfig> => getJSON('/api/sftp/config'),
@@ -296,7 +320,7 @@ export const api = {
   /* ── Agent配置管理 ── */
   adminGetAgentConfig: (agentId: string): Promise<{config: AgentConfig | null}> =>
     getJSON('/api/admin/agents/' + agentId + '/config'),
-  adminUpdateAgentConfig: (agentId: string, config: AgentConfig): Promise<{ok: boolean}> =>
+  adminUpdateAgentConfig: (agentId: string, config: AgentConfigPayload): Promise<{ok: boolean}> =>
     postJSON('/api/admin/agents/' + agentId + '/config', config, true, 'PUT'),
   
   /* ── Admin Agent CRUD ── */

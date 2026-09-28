@@ -11,32 +11,37 @@ import (
 
 // Peer WebRTC对等连接
 type Peer struct {
-	ID             string
-	conn           *webrtc.PeerConnection
-	dataChannels   map[string]*webrtc.DataChannel
-	dataChannelMu  sync.RWMutex
-	onDataChannel  func(name string, dc *webrtc.DataChannel)
-	onClose        func()
-	closed         bool
-	closedMu       sync.Mutex
+	ID            string
+	conn          *webrtc.PeerConnection
+	dataChannels  map[string]*webrtc.DataChannel
+	dataChannelMu sync.RWMutex
+	onDataChannel func(name string, dc *webrtc.DataChannel)
+	onClose       func()
+	closed        bool
+	closedMu      sync.Mutex
 }
 
 // NewPeer 创建新的对等连接
 func NewPeer(id string, config webrtc.Configuration) (*Peer, error) {
-pc, err := webrtc.NewPeerConnection(config)
+	pc, err := webrtc.NewPeerConnection(config)
 	if err != nil {
 		return nil, fmt.Errorf("创建PeerConnection失败: %w", err)
 	}
 
 	peer := &Peer{
-		ID:            id,
-		conn:          pc,
-		dataChannels:  make(map[string]*webrtc.DataChannel),
+		ID:           id,
+		conn:         pc,
+		dataChannels: make(map[string]*webrtc.DataChannel),
 	}
 
 	// 设置ICE连接状态回调
 	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
 		log.Printf("[GA-DC] ICE connection state: %s", state.String())
+		switch state {
+		case webrtc.ICEConnectionStateConnected, webrtc.ICEConnectionStateCompleted,
+			webrtc.ICEConnectionStateDisconnected, webrtc.ICEConnectionStateFailed:
+			logSelectedCandidatePair(pc)
+		}
 		if state == webrtc.ICEConnectionStateFailed {
 			peer.Close()
 		}
@@ -65,6 +70,32 @@ pc, err := webrtc.NewPeerConnection(config)
 	})
 
 	return peer, nil
+}
+
+// logSelectedCandidatePair 打印 ICE 选中候选对（P2P/relay 判定依据）
+func logSelectedCandidatePair(pc *webrtc.PeerConnection) {
+	sctp := pc.SCTP()
+	if sctp == nil || sctp.Transport() == nil {
+		log.Printf("[ICE-DIAG] selected pair: (no SCTP/DTLS transport)")
+		return
+	}
+	iceTransport := sctp.Transport().ICETransport()
+	if iceTransport == nil {
+		log.Printf("[ICE-DIAG] selected pair: (no ICE transport)")
+		return
+	}
+	pair, err := iceTransport.GetSelectedCandidatePair()
+	if err != nil {
+		log.Printf("[ICE-DIAG] selected pair: get failed: %v", err)
+		return
+	}
+	if pair == nil || pair.Local == nil || pair.Remote == nil {
+		log.Printf("[ICE-DIAG] selected pair: (nil)")
+		return
+	}
+	log.Printf("[ICE-DIAG] selected pair: local=%s:%d(%s,%s) <-> remote=%s:%d(%s,%s)",
+		pair.Local.Address, pair.Local.Port, pair.Local.Typ, pair.Local.Protocol,
+		pair.Remote.Address, pair.Remote.Port, pair.Remote.Typ, pair.Remote.Protocol)
 }
 
 // OnDataChannel 设置数据通道回调
@@ -123,7 +154,6 @@ func (p *Peer) setupDataChannel(name string, dc *webrtc.DataChannel) {
 		delete(p.dataChannels, name)
 		p.dataChannelMu.Unlock()
 	})
-
 
 }
 

@@ -1317,6 +1317,28 @@ _online_gateways: dict[str, dict] = {}  # gateway_id -> {ws, name, url, last_see
 _agent_connections: dict[str, dict] = {}  # room_id -> {browser_ws, agent_id, agent_ws}
 _setup_sessions: dict[str, dict] = {}  # sid -> {ws, agent_id, agent_name, created_at}
 
+# ── Agent↔Agent 测速(阶段S): 全局单并发 + 内存历史(deque, 不落库) ──
+_speedtest_active: dict | None = None  # {room, user_id, started, last_activity}
+_speedtest_history: collections.deque = collections.deque(maxlen=20)
+SPEEDTEST_DURATION = 10      # 每方向硬时限(秒)
+SPEEDTEST_TTL = 30           # 无进度兜底超时(秒)
+SPEEDTEST_LIMITS = (0, 10, 50, 100)  # 限速档: 0=无限制
+
+
+def _agent_config_with_mirror(config: dict) -> dict:
+    """双格式下发: 含 plugins 且无顶层 tunnels 时, 附加合并镜像(旧Agent 2.2.x兼容)"""
+    if not isinstance(config, dict) or "plugins" not in config or "tunnels" in config:
+        return config
+    merged = []
+    plugins = config.get("plugins") or {}
+    for key in ("tunnel", "socks5"):
+        bucket = plugins.get(key)
+        if isinstance(bucket, dict):
+            merged.extend(bucket.get("tunnels") or [])
+    out = dict(config)
+    out["tunnels"] = merged
+    return out
+
 
 async def _push_config_to_agent(agent_id: str, config: dict) -> bool:
     import json
@@ -1324,7 +1346,7 @@ async def _push_config_to_agent(agent_id: str, config: dict) -> bool:
         return False
     try:
         ws = _online_agents[agent_id]["ws"]
-        msg = json.dumps({"type": "config_update", "data": config})
+        msg = json.dumps({"type": "config_update", "data": _agent_config_with_mirror(config)})
         await ws.send_text(msg)
         return True
     except Exception:
@@ -1362,9 +1384,95 @@ async def push_upgrade_to_gateway(gateway_id: str, version: str, download_url: s
         return False
 
 
+async def _user_sees_agent(user_id: str, agent_id: str) -> bool:
+    """与 adminListAgents 相同的可见性过滤(owner/共享)"""
+    try:
+        async with get_db_session() as db:
+            r = await db.execute(
+                select(Agent.id).where(
+                    Agent.id == agent_id,
+                    (Agent.owner_id == user_id)
+                    | (Agent.shared_with == "all")
+                    | Agent.shared_with.contains(f'"{user_id}"'),
+                )
+            )
+            return r.scalar_one_or_none() is not None
+    except Exception as e:
+        _logger.warning("[SPEEDTEST] visibility check failed: %s", e)
+        return False
+
+
+async def _has_active_turn() -> bool:
+    """relay 强制: 存在启用的 coturn 才允许测速(TC-ST05)"""
+    try:
+        async with get_db_session() as db:
+            r = await db.execute(select(CoturnServer).where(CoturnServer.is_active == True).limit(1))
+            return r.scalar_one_or_none() is not None
+    except Exception as e:
+        _logger.warning("[SPEEDTEST] coturn check failed: %s", e)
+        return False
+
+
+async def _speedtest_end(room_id: str, reason: str = "", notify_agents: bool = True) -> None:
+    """结束测速会话: 释放全局锁/清房间/通知两端与浏览器(幂等)"""
+    global _speedtest_active
+    conn = _agent_connections.pop(room_id, None)
+    if _speedtest_active and _speedtest_active.get("room") == room_id:
+        _task = _speedtest_active.get("task")
+        if _task is not None:
+            _task.cancel()
+        _speedtest_active = None
+    if not conn:
+        return
+    if notify_agents:
+        # browser_ws=源Agent, agent_ws=目标Agent
+        for w in (conn.get("browser_ws"), conn.get("agent_ws")):
+            if w is None:
+                continue
+            try:
+                await w.send_text(json.dumps({"type": "speedtest_stop", "room_id": room_id, "detail": reason}))
+            except Exception:
+                pass
+    if reason and conn.get("progress_ws") is not None:
+        try:
+            await conn["progress_ws"].send_text(json.dumps({
+                "type": "speedtest_error", "room_id": room_id, "detail": reason,
+            }))
+        except Exception:
+            pass
+    _logger.info("[SPEEDTEST] session ended room=%s reason=%s", room_id, reason or "result")
+
+
+async def _speedtest_watchdog(room_id: str) -> None:
+    """30s TTL 兜底: 无进度即超时; 会话总时长上限 60s"""
+    while True:
+        await asyncio.sleep(5)
+        if room_id not in _agent_connections:
+            return
+        act = _speedtest_active
+        if not act or act.get("room") != room_id:
+            return
+        now = time.time()
+        if now - act["last_activity"] > SPEEDTEST_TTL or now - act["started"] > 60:
+            await _speedtest_end(room_id, reason=t("ws.speedtest_timeout"))
+            return
+
+
+def _speedtest_data(msg: dict) -> dict:
+    """提取 agent 上报的 payload(data 为 str/dict 兼容)"""
+    data = msg.get("data")
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except Exception:
+            data = {}
+    return data if isinstance(data, dict) else {}
+
+
 @router.websocket("/ws/webrtc")
 async def ws_webrtc(ws: WebSocket):
     """WebRTC 信令服务器 - 连接 wragent 和浏览器"""
+    global _speedtest_active
     await ws.accept()
     role = ""  # "agent" or "browser"
     agent_id = ""
@@ -1464,7 +1572,7 @@ async def ws_webrtc(ws: WebSocket):
                     "type": "register_success",
                     "agent_id": agent_id,
                     "ice_servers": _ice_servers,
-                    "config": _agent_config,
+                    "config": _agent_config_with_mirror(_agent_config),
                     "upgrade": _needs_upgrade,
                     "latest_version": _latest_version,
                 }))
@@ -1737,6 +1845,129 @@ async def ws_webrtc(ws: WebSocket):
                 await ws.send_text(json.dumps({"type": "connect_success", "room_id": room_id, "agent_id": target_agent_id}))
                 _logger.info("[TUNNEL] tunnel connected: agent=%s target=%s room=%s", agent_id, target_agent_id, room_id)
 
+            elif msg_type == "speedtest_start":
+                # 浏览器发起 Agent↔Agent 测速(阶段S): 校验→建房→通知两端
+                token = msg.get("token", "")
+                if not token:
+                    await ws.send_text(json.dumps({"type": "speedtest_error", "detail": t("ws.auth_failed")}))
+                    continue
+                try:
+                    from .auth import _decode_token
+                    _payload = _decode_token(token)
+                    _st_user = _payload.get("user_id", "")
+                except Exception:
+                    await ws.send_text(json.dumps({"type": "speedtest_error", "detail": t("ws.auth_failed")}))
+                    continue
+
+                _src = msg.get("source", "")
+                _dst = msg.get("target", "")
+                try:
+                    _limit = int(msg.get("mbps_limit", 0) or 0)
+                except (TypeError, ValueError):
+                    _limit = -1
+                if not _src or not _dst or _src == _dst:
+                    await ws.send_text(json.dumps({"type": "speedtest_error", "detail": t("ws.speedtest_same_agent")}))
+                    continue
+                if _limit not in SPEEDTEST_LIMITS:
+                    await ws.send_text(json.dumps({"type": "speedtest_error", "detail": t("ws.speedtest_invalid_limit")}))
+                    continue
+                # TTL 兜底: 先清陈旧会话, 再单并发判定(TC-ST03)
+                if _speedtest_active and time.time() - _speedtest_active["last_activity"] > SPEEDTEST_TTL:
+                    await _speedtest_end(_speedtest_active["room"], reason=t("ws.speedtest_timeout"))
+                if _speedtest_active is not None:
+                    await ws.send_text(json.dumps({"type": "speedtest_error", "detail": t("ws.speedtest_busy")}))
+                    continue
+                if _src not in _online_agents:
+                    await ws.send_text(json.dumps({"type": "speedtest_error", "detail": t("ws.agent_offline")}))
+                    continue
+                if _dst not in _online_agents:
+                    await ws.send_text(json.dumps({"type": "speedtest_error", "detail": t("ws.target_agent_offline")}))
+                    continue
+                if not (await _user_sees_agent(_st_user, _src)) or not (await _user_sees_agent(_st_user, _dst)):
+                    await ws.send_text(json.dumps({"type": "speedtest_error", "detail": t("ws.speedtest_permission")}))
+                    continue
+                if not (await _has_active_turn()):
+                    await ws.send_text(json.dumps({"type": "speedtest_error", "detail": t("ws.speedtest_need_turn")}))
+                    continue
+
+                _room = f"speedtest_{_src}_{_dst}_{int(time.time())}"
+                _now = time.time()
+                _agent_connections[_room] = {
+                    "browser_ws": _online_agents[_src]["ws"],   # SDP offer 源=发起Agent
+                    "agent_id": _dst,
+                    "agent_ws": _online_agents[_dst]["ws"],
+                    "user_id": f"speedtest:{_st_user}",
+                    "progress_ws": ws,                          # 结果/进度回传浏览器
+                    "speedtest_src": _src,
+                    "created_at": _now,
+                }
+                _speedtest_active = {
+                    "room": _room, "user_id": _st_user,
+                    "started": _now, "last_activity": _now,
+                    "task": asyncio.create_task(_speedtest_watchdog(_room)),
+                }
+                # data 包装: Agent 端 ws.Message 解析 msg.Data(Go), 顶层字段保留兼容测试/诊断
+                await _online_agents[_src]["ws"].send_text(json.dumps({
+                    "type": "speedtest_connect", "room_id": _room,
+                    "duration": SPEEDTEST_DURATION, "mbps_limit": _limit,
+                    "data": {"room_id": _room, "duration": SPEEDTEST_DURATION, "mbps_limit": _limit},
+                }))
+                await _online_agents[_dst]["ws"].send_text(json.dumps({"type": "browser_connect", "room_id": _room}))
+                await ws.send_text(json.dumps({
+                    "type": "speedtest_started", "room_id": _room,
+                    "source": _src, "target": _dst, "mbps_limit": _limit,
+                    "duration": SPEEDTEST_DURATION,
+                }))
+                _logger.info("[SPEEDTEST] started by=%s src=%s dst=%s limit=%s room=%s",
+                              _st_user, _src, _dst, _limit, _room)
+
+            elif msg_type in ("speedtest_progress", "speedtest_result", "speedtest_error"):
+                # agent → 浏览器: 进度/结果/错误转发(仅房间成员)
+                room_id = msg.get("room_id", "")
+                conn = _agent_connections.get(room_id)
+                if not conn:
+                    continue
+                if not (conn.get("browser_ws") is ws or conn.get("agent_ws") is ws):
+                    _logger.warning("[SPEEDTEST] %s rejected: room=%s sender not member", msg_type, room_id)
+                    continue
+                payload = _speedtest_data(msg) or {k: v for k, v in msg.items() if k != "data"}
+                if _speedtest_active and _speedtest_active.get("room") == room_id:
+                    _speedtest_active["last_activity"] = time.time()
+                target_ws = conn.get("progress_ws")
+                if msg_type == "speedtest_result":
+                    _speedtest_history.append({
+                        "source": conn.get("speedtest_src", ""),
+                        "target": conn.get("agent_id", ""),
+                        "user_id": _speedtest_active["user_id"] if _speedtest_active else "",
+                        "up_mbps": payload.get("up_mbps", 0),
+                        "down_mbps": payload.get("down_mbps", 0),
+                        "duration": payload.get("duration", 0),
+                        "finished_at": time.time(),
+                    })
+                if target_ws is not None:
+                    try:
+                        await target_ws.send_text(json.dumps(payload))
+                    except Exception:
+                        # 浏览器已断开 → 会话终止
+                        await _speedtest_end(room_id, reason=t("ws.speedtest_timeout"), notify_agents=True)
+                        continue
+                if msg_type in ("speedtest_result", "speedtest_error"):
+                    await _speedtest_end(room_id,
+                                         reason=payload.get("detail", "") if msg_type == "speedtest_error" else "",
+                                         notify_agents=False)
+
+            elif msg_type == "speedtest_cancel":
+                # 浏览器中止: 双端 stop + 清房间(TC-ST02)
+                room_id = msg.get("room_id", "")
+                conn = _agent_connections.get(room_id)
+                if not conn or conn.get("progress_ws") is not ws:
+                    continue
+                await _speedtest_end(room_id, reason="", notify_agents=True)
+                try:
+                    await ws.send_text(json.dumps({"type": "speedtest_cancelled", "room_id": room_id}))
+                except Exception:
+                    pass
+
             elif msg_type == "offer":
                 # 转发 Offer 到 agent — R3: 仅房间成员(browser/gateway)可发
                 room_id = msg.get("room_id", "")
@@ -1996,10 +2227,13 @@ async def ws_webrtc(ws: WebSocket):
         rooms_to_remove = []
         for room_id, conn in _agent_connections.items():
             if (conn.get("agent_ws") == ws or conn.get("browser_ws") == ws
-                    or conn.get("gateway_ws") == ws):
+                    or conn.get("gateway_ws") == ws or conn.get("progress_ws") == ws):
                 rooms_to_remove.append(room_id)
         for room_id in rooms_to_remove:
             del _agent_connections[room_id]
+        # 测速会话随任一端断开而释放(浏览器断开=取消)
+        if _speedtest_active and _speedtest_active.get("room") in rooms_to_remove:
+            _speedtest_active = None
         try:
             await ws.close()
         except Exception:
@@ -2037,6 +2271,14 @@ def list_gateways(user: dict = Depends(get_current_user)):
             "last_seen": info["last_seen"],
         })
     return {"gateways": gateways_list}
+
+
+@router.get("/webrtc/speedtest/history")
+def speedtest_history(user: dict = Depends(get_current_user)):
+    """最近 20 条测速结果(进程内存, 仅本人发起的)"""
+    uid = user.get("id", "")
+    items = [h for h in _speedtest_history if h.get("user_id") == uid]
+    return {"history": items[-20:]}
 
 
 @router.get("/webrtc/rooms")

@@ -216,16 +216,41 @@ async function downloadFile(f: RemoteFile) {
       body: JSON.stringify({ ...connParams(), path }),
     })
     if (!res.ok) throw new Error(t('sftpBrowser.downloadFailed') || 'download failed')
-    const blob = await res.blob()
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = f.name
-    a.click()
-    URL.revokeObjectURL(url)
+    saveBlob(await res.blob(), f.name)
+    return
   } catch (e: any) {
+    // HTTP 兜底不可用（后端无法直连 Agent 内网主机）→ 经 WebRTC/网关通道分片读取
+    if (props.webrtcManager) {
+      try {
+        const result = await props.webrtcManager.sendSftpRequest('read', { path })
+        saveBlob(new Blob([Uint8Array.from(atob(result.content), (c) => c.charCodeAt(0))]), f.name)
+        return
+      } catch (e2: any) {
+        toast?.error?.(e2.message || t('sftpBrowser.downloadFailed'))
+        return
+      }
+    }
     toast?.error?.(e.message || t('sftpBrowser.downloadFailed'))
   }
+}
+
+function saveBlob(blob: Blob, name: string) {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = name
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+function arrayBufferToBase64(buf: ArrayBuffer): string {
+  const bytes = new Uint8Array(buf)
+  let bin = ''
+  const CHUNK = 0x8000
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + CHUNK)) as unknown as number[])
+  }
+  return btoa(bin)
 }
 
 function openNewDialog(type: 'file' | 'dir') { newType.value = type; newName.value = ''; showNewDialog.value = true }
@@ -299,7 +324,23 @@ function handleUpload() {
         })
         if (!res.ok) throw new Error(t('sftpBrowser.uploadFailed'))
       }
-      catch (e: any) { toast?.error?.(e.message || t('sftpBrowser.uploadFileFailed', { name: file.name })) }
+      catch (e: any) {
+        // HTTP 兜底不可用（后端无法直连 Agent 内网主机）→ 经 WebRTC/网关通道分片写入
+        if (props.webrtcManager) {
+          try {
+            const buf = await file.arrayBuffer()
+            await props.webrtcManager.sendSftpRequest('write', {
+              path: currentPath.value.replace(/\/$/, '') + '/' + file.name,
+              content: arrayBufferToBase64(buf),
+            })
+            continue
+          } catch (e2: any) {
+            toast?.error?.(e2.message || t('sftpBrowser.uploadFileFailed', { name: file.name }))
+            continue
+          }
+        }
+        toast?.error?.(e.message || t('sftpBrowser.uploadFileFailed', { name: file.name }))
+      }
     }
     toast?.success?.(t('sftpBrowser.uploadComplete')); loadDir(currentPath.value)
   }

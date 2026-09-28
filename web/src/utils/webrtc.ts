@@ -10,6 +10,11 @@ export const MSG_RESIZE = 0x02
 export const MSG_ACK = 0x03
 export const MSG_SFTP_REQUEST = 0x10
 export const MSG_SFTP_RESPONSE = 0x11
+// SFTP 分片传输：DataChannel 单条消息上限 65536 字节（pion 与浏览器 SCTP 一致），
+// 超限会被 pion 拒绝（outbound packet larger than maximum message size），
+// 因此读写请求/响应超过阈值时分片发送，按 req_id 重组。
+export const SFTP_SINGLE_LIMIT = 32 * 1024
+export const SFTP_CHUNK_SIZE = 24 * 1024
 export const MSG_VNC_CONNECT = 0x20
 export const MSG_VNC_DATA = 0x21
 export const MSG_VNC_DISCONNECT = 0x22
@@ -18,6 +23,16 @@ export const MSG_VNC_RESIZE = 0x24
 export const MSG_VNC_CLIPBOARD = 0x25
 export const MSG_VNC_ERROR = 0x2F
 export const MSG_ERROR = 0xFF
+
+// Uint8Array -> base64（分片传输用，分块避免超大字符串一次性转换）
+function bytesToBase64(bytes: Uint8Array): string {
+  let bin = ''
+  const CHUNK = 0x8000
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + CHUNK)) as unknown as number[])
+  }
+  return btoa(bin)
+}
 
 export interface AgentInfo {
   id: string
@@ -106,6 +121,7 @@ type SharedDirectMember = {
   roomId: string
   agentId: string
   token: string
+  noConnect?: boolean
   onText: (msg: any) => void
   onOpen: () => void
   onClose: () => void
@@ -241,6 +257,7 @@ class SharedDirectSignal {
   }
 
   private sendConnect(m: SharedDirectMember): void {
+    if (m.noConnect) return
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return
     try {
       this.ws.send(JSON.stringify({
@@ -301,6 +318,19 @@ class SharedDirectSignal {
 
 const _sharedDirect = new SharedDirectSignal()
 
+/** 测速虚拟成员: 不发 connect_agent, 仅收广播消息(speedtest_* 房间未知 → onmessage 广播) */
+export function speedtestSubscribe(onMsg: (msg: any) => void): () => void {
+  _sharedDirect.join({
+    roomId: "__speedtest__", agentId: "", token: "", noConnect: true,
+    onText: onMsg, onOpen: () => {}, onClose: () => {}, onError: () => {},
+  })
+  return () => _sharedDirect.leave("__speedtest__")
+}
+
+export function speedtestSend(payload: Record<string, unknown>): boolean {
+  return _sharedDirect.send("__speedtest__", payload)
+}
+
 export class WebRTCManager {
   private peerConnection: RTCPeerConnection | null = null
   private token: string
@@ -339,7 +369,16 @@ export class WebRTCManager {
   }
   private sshConnected: boolean = false
   private onSshConnected: (() => void) | null = null
-  private sftpCallbacks: Map<string, { resolve: (v: any) => void; reject: (e: Error) => void }> = new Map()
+  private sftpCallbacks: Map<string, {
+    resolve: (v: any) => void
+    reject: (e: Error) => void
+    timer?: ReturnType<typeof setTimeout>
+    startedAt?: number
+    timeoutMs?: number
+    arm?: () => void
+  }> = new Map()
+  // 分片响应重组缓冲：req_id -> 各分片
+  private sftpChunkBuf: Map<string, { parts: (Uint8Array | null)[]; n: number; got: number }> = new Map()
   // P3: 终端输出 seq 追踪 + 背压丢帧空洞检测 + 节流 ack
   private lastTermSeq = -1
   private termGapTotal = 0
@@ -696,13 +735,7 @@ export class WebRTCManager {
         break
       case "sftp_response": {
         if (this.gatewayUrl) {
-          const cb = this.sftpCallbacks.get(msg.req_id)
-          if (cb) {
-            this.sftpCallbacks.delete(msg.req_id)
-            if (msg.ok) cb.resolve(msg)
-            else cb.reject(new Error(msg.detail || "SFTP操作失败"))
-          }
-          if (this.onSftpResponse) this.onSftpResponse(msg)
+          this.handleSftpResponse(msg)
         }
         break
       }
@@ -925,13 +958,7 @@ export class WebRTCManager {
         try {
           const text = new TextDecoder().decode(payload)
           const msg = JSON.parse(text)
-          const cb = this.sftpCallbacks.get(msg.req_id)
-          if (cb) {
-            this.sftpCallbacks.delete(msg.req_id)
-            if (msg.ok) cb.resolve(msg)
-            else cb.reject(new Error(msg.detail || "SFTP操作失败"))
-          }
-          if (this.onSftpResponse) this.onSftpResponse(msg)
+          this.handleSftpResponse(msg)
         } catch {}
         break
       }
@@ -1081,17 +1108,19 @@ export class WebRTCManager {
     auth_type: string
     password?: string
     key_path?: string
+    mode?: string   // "local"=webterm 本地shell(免SSH服务, 网关整体重打包透传)
   }, cols: number, rows: number): void {
     if (this.gatewayUrl) {
       if (!this.signalWs || this.signalWs.readyState !== WebSocket.OPEN) {
         log(LogLevel.ERROR, "BG-WS", "sendSshConnect: signal WS not open")
         return
       }
-      log(LogLevel.INFO, "BG-WS", "sendSshConnect:", conn.username + "@" + conn.host + ":" + conn.port)
+      log(LogLevel.INFO, "BG-WS", "sendSshConnect:", (conn.mode === "local" ? "[webterm] " : "") + conn.username + "@" + conn.host + ":" + conn.port)
       this.signalWs.send(JSON.stringify({
         type: "ssh_connect", room_id: this.roomId,
         host: conn.host, port: conn.port, username: conn.username,
         auth_type: conn.auth_type, password: conn.password || "", cols, rows,
+        ...(conn.mode ? { mode: conn.mode } : {}),
       }))
       // R7: 不在发送时乐观置位，等 ssh_connect_result/首帧数据确认
       this.sshConnected = false
@@ -1101,7 +1130,7 @@ export class WebRTCManager {
       log(LogLevel.ERROR, "BA-DC", "sendSshConnect: DataChannel not open, state:", this.dataChannel?.readyState)
       return
     }
-    log(LogLevel.INFO, "BA-DC", "sendSshConnect:", conn.username + "@" + conn.host + ":" + conn.port, cols + "x" + rows)
+    log(LogLevel.INFO, "BA-DC", "sendSshConnect:", (conn.mode === "local" ? "[webterm] " : "") + conn.username + "@" + conn.host + ":" + conn.port, cols + "x" + rows)
     const msg = {
       type: "ssh_connect",
       host: conn.host,
@@ -1111,6 +1140,7 @@ export class WebRTCManager {
       password: conn.password || "",
       cols,
       rows,
+      ...(conn.mode ? { mode: conn.mode } : {}),
     }
     const encoded = new TextEncoder().encode(JSON.stringify(msg))
     const prefixed = new Uint8Array(1 + encoded.length)
@@ -1138,53 +1168,145 @@ export class WebRTCManager {
   }
 
   // --- SFTP请求 ---
+  // 注册回调并启动超时；分片到达会调用 arm() 续期（单次间隔仍为 timeoutMs，总时长封顶 4 倍）
+  private trackSftp(reqId: string, resolve: (v: any) => void, reject: (e: Error) => void, timeoutMs: number): void {
+    const entry: { resolve: (v: any) => void; reject: (e: Error) => void; timer?: ReturnType<typeof setTimeout>; startedAt: number; timeoutMs: number; arm?: () => void } =
+      { resolve, reject, startedAt: Date.now(), timeoutMs }
+    const arm = () => {
+      if (entry.timer) clearTimeout(entry.timer)
+      const left = timeoutMs * 4 - (Date.now() - entry.startedAt)
+      const wait = left <= 0 ? 1 : Math.min(timeoutMs, left)
+      entry.timer = setTimeout(() => {
+        if (this.sftpCallbacks.has(reqId)) {
+          this.sftpCallbacks.delete(reqId)
+          this.sftpChunkBuf.delete(reqId)
+          reject(new Error("SFTP请求超时"))
+        }
+      }, wait)
+    }
+    entry.arm = arm
+    arm()
+    this.sftpCallbacks.set(reqId, entry)
+  }
+
+  // 统一处理 SFTP 响应：分片先重组，完整消息再触发回调
+  private handleSftpResponse(msg: any): void {
+    if (msg && msg.chunk) {
+      const full = this.collectSftpChunk(msg)
+      if (!full) return
+      msg = full
+    }
+    const cb = this.sftpCallbacks.get(msg.req_id)
+    if (cb) {
+      this.sftpCallbacks.delete(msg.req_id)
+      this.sftpChunkBuf.delete(msg.req_id)
+      if (cb.timer) clearTimeout(cb.timer)
+      if (msg.ok) cb.resolve(msg)
+      else cb.reject(new Error(msg.detail || "SFTP操作失败"))
+    }
+    if (this.onSftpResponse) this.onSftpResponse(msg)
+  }
+
+  // 收集分片；收齐后拼装并解析出完整响应（未收齐返回 null）
+  private collectSftpChunk(msg: any): any | null {
+    const reqId = msg.req_id
+    const c = msg.chunk
+    if (!reqId || !c || typeof c.i !== 'number' || typeof c.n !== 'number') return null
+    let buf = this.sftpChunkBuf.get(reqId)
+    if (!buf) {
+      buf = { parts: new Array(c.n).fill(null), n: c.n, got: 0 }
+      this.sftpChunkBuf.set(reqId, buf)
+    }
+    if (c.i >= 0 && c.i < buf.n && buf.parts[c.i] == null) {
+      try {
+        const bin = atob(c.data)
+        const bytes = new Uint8Array(bin.length)
+        for (let k = 0; k < bin.length; k++) bytes[k] = bin.charCodeAt(k)
+        buf.parts[c.i] = bytes
+        buf.got++
+      } catch {
+        return null
+      }
+    }
+    const cb = this.sftpCallbacks.get(reqId)
+    if (cb && cb.arm) cb.arm()
+    if (buf.got < buf.n) return null
+    this.sftpChunkBuf.delete(reqId)
+    try {
+      let total = 0
+      for (const p of buf.parts) total += p ? p.length : 0
+      const all = new Uint8Array(total)
+      let off = 0
+      for (const p of buf.parts) {
+        if (p) { all.set(p, off); off += p.length }
+      }
+      return JSON.parse(new TextDecoder().decode(all))
+    } catch (e) {
+      log(LogLevel.WARN, "BA-DC", "SFTP chunk assemble failed:", e)
+      return null
+    }
+  }
+
   sendSftpRequest(op: string, params: Record<string, any> = {}): Promise<any> {
     return new Promise((resolve, reject) => {
-      // 动态超时: list/stat/delete/rename 5s, read/write 30s
+      // 动态超时: list/stat/delete/rename 5s, read/write 30s（分片到达续期）
       const timeoutMs = (op === 'list' || op === 'stat' || op === 'delete' || op === 'rename') ? 5000 : 30000
-      if (this.gatewayUrl) {
+      const isGateway = !!this.gatewayUrl
+      if (isGateway) {
         if (!this.signalWs || this.signalWs.readyState !== WebSocket.OPEN) {
           reject(new Error("信令通道未连接"))
           return
         }
         log(LogLevel.INFO, "BG-WS", "sendSftpRequest:", op, params.path || params.old_path || "")
-        const reqId = crypto.randomUUID()
-        this.sftpCallbacks.set(reqId, { resolve, reject })
-        setTimeout(() => {
-          if (this.sftpCallbacks.has(reqId)) {
-            this.sftpCallbacks.delete(reqId)
-            reject(new Error("SFTP请求超时"))
-          }
-        }, timeoutMs)
-        this.signalWs.send(JSON.stringify({ type: "sftp_request", room_id: this.roomId, op, req_id: reqId, ...params }))
-        return
-      }
-      if (!this.dataChannel || this.dataChannel.readyState !== "open") {
-        log(LogLevel.WARN, "BA-DC", "sendSftpRequest rejected: channel state =", this.dataChannel?.readyState ?? "null")
-        reject(new Error("数据通道未连接"))
-        return
-      }
-      if (!this.sshConnected) {
-        log(LogLevel.WARN, "BA-DC", "sendSftpRequest rejected: ssh not connected yet")
-        reject(new Error("SSH连接未建立"))
-        return
-      }
-      log(LogLevel.INFO, "BA-DC", "sendSftpRequest:", op, params.path || params.old_path || "")
-      const reqId = crypto.randomUUID()
-      this.sftpCallbacks.set(reqId, { resolve, reject })
-      setTimeout(() => {
-        if (this.sftpCallbacks.has(reqId)) {
-          this.sftpCallbacks.delete(reqId)
-          reject(new Error("SFTP请求超时"))
+      } else {
+        if (!this.dataChannel || this.dataChannel.readyState !== "open") {
+          log(LogLevel.WARN, "BA-DC", "sendSftpRequest rejected: channel state =", this.dataChannel?.readyState ?? "null")
+          reject(new Error("数据通道未连接"))
+          return
         }
-      }, timeoutMs)
+        if (!this.sshConnected) {
+          log(LogLevel.WARN, "BA-DC", "sendSftpRequest rejected: ssh not connected yet")
+          reject(new Error("SSH连接未建立"))
+          return
+        }
+        log(LogLevel.INFO, "BA-DC", "sendSftpRequest:", op, params.path || params.old_path || "")
+      }
 
-      const msg = { type: "sftp", op, req_id: reqId, ...params }
+      const reqId = crypto.randomUUID()
+      this.trackSftp(reqId, resolve, reject, timeoutMs)
+
+      const sendJson = (obj: Record<string, any>) => {
+        if (isGateway) {
+          this.signalWs!.send(JSON.stringify(obj))
+          return
+        }
+        const encoded = new TextEncoder().encode(JSON.stringify(obj))
+        const prefixed = new Uint8Array(1 + encoded.length)
+        prefixed[0] = MSG_SFTP_REQUEST
+        prefixed.set(encoded, 1)
+        this.dataChannel!.send(prefixed)
+      }
+
+      const msg: Record<string, any> = isGateway
+        ? { type: "sftp_request", room_id: this.roomId, op, req_id: reqId, ...params }
+        : { type: "sftp", op, req_id: reqId, ...params }
       const encoded = new TextEncoder().encode(JSON.stringify(msg))
-      const prefixed = new Uint8Array(1 + encoded.length)
-      prefixed[0] = MSG_SFTP_REQUEST
-      prefixed.set(encoded, 1)
-      this.dataChannel.send(prefixed)
+      if (encoded.length <= SFTP_SINGLE_LIMIT) {
+        sendJson(msg)
+        return
+      }
+      // 超过单条 DC 上限：分片发送，末条为不含 content 的装配指令（chunks=n）
+      const n = Math.ceil(encoded.length / SFTP_CHUNK_SIZE)
+      for (let i = 0; i < n; i++) {
+        const s = i * SFTP_CHUNK_SIZE
+        const bytes = encoded.subarray(s, Math.min(s + SFTP_CHUNK_SIZE, encoded.length))
+        sendJson({ type: msg.type, room_id: msg.room_id, op, req_id: reqId, chunk: { i, n, data: bytesToBase64(bytes) } })
+      }
+      const finalMsg: Record<string, any> = { ...msg }
+      delete finalMsg.content
+      finalMsg.chunks = n
+      sendJson(finalMsg)
+      log(LogLevel.INFO, isGateway ? "BG-WS" : "BA-DC", "sendSftpRequest chunked:", n, "chunks, op =", op, "bytes =", encoded.length)
     })
   }
 
@@ -1376,26 +1498,43 @@ export class WebRTCManager {
   }
 
   private parseConnType(stats: RTCStatsReport): string {
-    let connType = "unknown"
+    type PairInfo = { bytes: number; nominated: boolean; lt: string; rt: string; lp: any; rp: any }
+    const pairs: PairInfo[] = []
     stats.forEach((report: any) => {
       if (report.type !== "candidate-pair") return
-      const selected = report.nominated || report.state === "succeeded" || report.selected
-      if (!selected) return
       const local = stats.get(report.localCandidateId)
+      if (!local || (local as any).type !== "local-candidate") return
       const remote = stats.get(report.remoteCandidateId)
-      if (!local || local.type !== "local-candidate") return
-      const lt = (local as any).candidateType
-      const lp = (local as any).address
-      const rt = remote ? (remote as any).candidateType : "unknown"
-      const rp = (remote as any)?.address
-      log(LogLevel.DEBUG, "BA-DC", "Selected pair: local=" + lp + " (" + lt + ") remote=" + rp + " (" + rt + ")")
-      if (lt === "relay" || rt === "relay") {
-        connType = "relay"
-      } else if (lt === "host" || lt === "srflx" || lt === "prflx") {
-        connType = "P2P"
-      }
+      pairs.push({
+        bytes: (report.bytesReceived || 0) + (report.bytesSent || 0),
+        nominated: report.nominated === true || report.selected === true,
+        lt: (local as any).candidateType,
+        rt: remote ? (remote as any).candidateType : "unknown",
+        lp: (local as any).address,
+        rp: remote ? (remote as any).address : undefined,
+      })
     })
-    return connType
+    if (!pairs.length) return "unknown"
+    // 判定链路：优先取真正承载数据的 pair（bytes 最大），其次取 nominated/selected。
+    // 不再把任意 state==="succeeded" 的探测 pair 当作选中链路——中继场景下
+    // 多条 host/prflx pair 也会 succeeded，导致中转被误报成 P2P。
+    let pick: PairInfo | undefined
+    const carrying = pairs.filter((p) => p.bytes > 0)
+    if (carrying.length) {
+      pick = carrying.reduce((a, b) => (b.bytes > a.bytes ? b : a))
+    } else {
+      const nominated = pairs.filter((p) => p.nominated)
+      pick = nominated[nominated.length - 1]
+    }
+    if (!pick) return "unknown"
+    log(LogLevel.DEBUG, "BA-DC", "Selected pair: local=" + pick.lp + " (" + pick.lt + ") remote=" + pick.rp + " (" + pick.rt + ") bytes=" + pick.bytes)
+    if (pick.lt === "relay" || pick.rt === "relay") {
+      return "relay"
+    }
+    if (pick.lt === "host" || pick.lt === "srflx" || pick.lt === "prflx") {
+      return "P2P"
+    }
+    return "unknown"
   }
 
   private async detectConnType(): Promise<void> {
@@ -1591,6 +1730,7 @@ export class WebRTCManager {
     this.onOpenFired = false
     this.diagReported = false
     this.sftpCallbacks.clear()
+    this.sftpChunkBuf.clear()
     this.onTerminalData = null
     this.onSftpResponse = null
     this.onVncData = null

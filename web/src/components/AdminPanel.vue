@@ -64,6 +64,17 @@ function openAgentConfig(a: any) {
 function closeAgentConfig() {
   configAgentId.value = ''
 }
+function onAgentInfoUpdated(payload: { name?: string } | undefined) {
+  if (payload?.name && configAgentId.value) configAgentName.value = payload.name
+  loadAgents()
+}
+function onAgentToken(token: string) {
+  agentTokenValue.value = token
+  deployAgentId.value = configAgentId.value
+  deployMethod.value = 'docker'
+  agentGuideStep.value = 1
+  showAgentToken.value = true
+}
 
 const filteredUsers = computed(() => {
   if (!userSearch.value) return users.value
@@ -157,8 +168,6 @@ async function loadRoles() {
 const agents = ref<any[]>([])
 const agentSearch = ref('')
 const showAgentForm = ref(false)
-const isEditAgent = ref(false)
-const editingAgentId = ref('')
 const agentForm = ref({ id: '', name: '', coturn_id: '', remark: '' })
 const showAgentToken = ref(false)
 const agentTokenValue = ref('')
@@ -267,41 +276,19 @@ async function fetchNextAgentId() {
 
 function openNewAgent() {
   agentForm.value = { id: '', name: '', coturn_id: '', remark: '' }
-  isEditAgent.value = false; editingAgentId.value = ''; showAgentForm.value = true
+  showAgentForm.value = true
   fetchNextAgentId()
-}
-
-function openEditAgent(a: any) {
-  agentForm.value = { id: a.id, name: a.name, coturn_id: a.coturn_id || '', remark: a.remark || '' }
-  isEditAgent.value = true; editingAgentId.value = a.id; showAgentForm.value = true
 }
 
 async function saveAgent() {
   try {
-    if (isEditAgent.value) {
-      await api.adminUpdateAgent(editingAgentId.value, { name: agentForm.value.name, coturn_id: agentForm.value.coturn_id, remark: agentForm.value.remark })
-    } else {
-      const result = await api.adminAddAgent({ id: agentForm.value.id, name: agentForm.value.name, coturn_id: agentForm.value.coturn_id, remark: agentForm.value.remark })
-      agentTokenValue.value = result.token
-      deployAgentId.value = agentForm.value.id
-      deployMethod.value = 'docker'
-      agentGuideStep.value = 1
-      showAgentToken.value = true
-    }
-    showAgentForm.value = false; await loadAgents(); toast?.success(isEditAgent.value ? t('admin.updated') : t('admin.created'))
-  } catch (e: any) { toast?.error(e.message) }
-}
-
-const showRegenConfirm = ref(false)
-
-async function doRegenerateToken() {
-  try {
-    const r = await api.adminRegenerateToken(editingAgentId.value)
-    agentTokenValue.value = r.token
-    showRegenConfirm.value = false
-    showAgentForm.value = false
+    const result = await api.adminAddAgent({ id: agentForm.value.id, name: agentForm.value.name, coturn_id: agentForm.value.coturn_id, remark: agentForm.value.remark })
+    agentTokenValue.value = result.token
+    deployAgentId.value = agentForm.value.id
+    deployMethod.value = 'docker'
+    agentGuideStep.value = 1
     showAgentToken.value = true
-    toast?.success(t('admin.tokenRegenerated'))
+    showAgentForm.value = false; await loadAgents(); toast?.success(t('admin.created'))
   } catch (e: any) { toast?.error(e.message) }
 }
 
@@ -874,7 +861,6 @@ function fmtAuditTime(ts: string): string {
                     <button v-if="a.needs_upgrade" class="text-btn success" @click="upgradeAgent(a.id)" style="color:#16a34a" :disabled="upgradingAgents.has(a.id)">{{ upgradingAgents.has(a.id) ? t('common.upgrading') : (t('admin.upgradeVersion') + a.latest_version) }}</button>
                     <button class="text-btn info" :disabled="!a.online || detectingAgents.has(a.id)" @click="detectOneAgent(a)">{{ detectingAgents.has(a.id) ? t('common.detecting') : t('admin.detectOne') }}</button>
                     <button class="text-btn" @click="openAgentConfig(a)">{{ t('sftp.config') }}</button>
-                    <button class="text-btn" @click="openEditAgent(a)">{{ t('common.edit') }}</button>
                     <button class="text-btn" :class="a.is_active ? 'warn' : 'success'" @click="toggleAgentStatus(a.id)">{{ a.is_active ? t('common.disabled') : t('common.enabled') }}</button>
                     <button class="text-btn" @click="openDeployScript(a.id)">{{ t('ssh.deployScript') }}</button>
                     <button class="text-btn danger" @click="openDeleteAgent(a)">{{ t('common.delete') }}</button>
@@ -1141,12 +1127,12 @@ function fmtAuditTime(ts: string): string {
     <Teleport to="body">
       <div v-if="showAgentForm" class="modal-mask" @click.self="showAgentForm = false">
         <div class="modal-box" style="width:440px">
-          <h3>{{ isEditAgent ? t('admin.editAgentTitle') : t('admin.newIdTitle') }}</h3>
+          <h3>{{ t('admin.newIdTitle') }}</h3>
           <div class="form-row">
             <label>Agent ID</label>
             <div class="input-with-btn">
-              <input v-model="agentForm.id" :disabled="isEditAgent" readonly />
-              <button v-if="!isEditAgent" class="icon-btn" @click="fetchNextAgentId" title="刷新ID">🔄</button>
+              <input v-model="agentForm.id" readonly />
+              <button class="icon-btn" @click="fetchNextAgentId" title="刷新ID">🔄</button>
             </div>
           </div>
           <div class="form-row"><label>{{ t('common.name') }}</label><input v-model="agentForm.name" :placeholder="t('admin.displayName')" /></div>
@@ -1158,9 +1144,6 @@ function fmtAuditTime(ts: string): string {
             </select>
           </div>
           <div class="form-row"><label>{{ t('admin.optionalRemark') }}</label><input v-model="agentForm.remark" :placeholder="t('admin.optionalRemark')" /></div>
-          <div v-if="isEditAgent" class="token-regen-section">
-            <button class="btn danger" @click="showRegenConfirm = true">🔄 {{ t('admin.regenToken') }}</button>
-          </div>
           <div class="modal-actions">
             <button class="btn" @click="showAgentForm = false">{{ t('common.cancel') }}</button>
             <button class="btn primary" @click="saveAgent">{{ t('common.confirm') }}</button>
@@ -1304,20 +1287,6 @@ function fmtAuditTime(ts: string): string {
       </div>
     </Teleport>
 
-    <!-- ═══ 重新生成Token确认 ═══ -->
-    <Teleport to="body">
-      <div v-if="showRegenConfirm" class="modal-mask" @click.self="showRegenConfirm = false">
-        <div class="modal-box modal-danger" style="width:420px">
-          <h3>⚠️ {{ t('admin.regenToken') }}</h3>
-          <p>{{ t('admin.regenTokenConfirm') }}<b>{{ deleteAgentName }}</b>{{ t('admin.regenTokenTip') }}{{ t('admin.regenTokenWarning') }}</p>
-          <div class="modal-actions">
-            <button class="btn" @click="showRegenConfirm = false">{{ t('common.cancel') }}</button>
-            <button class="btn danger" @click="doRegenerateToken">{{ t('common.confirm') }}</button>
-          </div>
-        </div>
-      </div>
-    </Teleport>
-
     <!-- ═══ coturn表单弹窗 ═══ -->
     <Teleport to="body">
       <div v-if="showCoturnForm" class="modal-mask" @click.self="showCoturnForm = false">
@@ -1456,6 +1425,8 @@ function fmtAuditTime(ts: string): string {
       :agent-name="configAgentName"
       :agent-online="configAgentOnline"
       @close="closeAgentConfig"
+      @updated="onAgentInfoUpdated"
+      @token="onAgentToken"
     />
   </div>
 </template>
@@ -1565,7 +1536,7 @@ function fmtAuditTime(ts: string): string {
 .form-row-2col .form-row { flex: 1; }
 .form-select { appearance: auto; }
 
-.token-regen-section { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border); }
+
 
 .test-loading { display:flex; align-items:center; gap:10px; padding:24px 0; color:var(--muted); font-size:14px; }
 .spinner, .test-spinner { width:20px; height:20px; border:2px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:spin .8s linear infinite; display:inline-block; vertical-align:middle; margin-right:4px; }

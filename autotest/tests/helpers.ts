@@ -260,7 +260,9 @@ export async function termTypeAndCheck(page: Page, command: string, expected: st
   const textarea = page.locator('textarea.xterm-helper-textarea').first()
   await expect(textarea).toBeVisible({ timeout: 15000 })
   await textarea.click()
-  await textarea.fill(command + '\n')
+  // fill() 的 "\n" 不会触发 xterm 回车(只会作为文本插入), 必须显式 press Enter
+  await textarea.fill(command.replace(/\n+$/, ''))
+  await textarea.press('Enter')
   const deadline = Date.now() + 15000
   let text = ''
   while (Date.now() < deadline) {

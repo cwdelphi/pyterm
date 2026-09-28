@@ -3,6 +3,7 @@ module github.com/ppy-tools/wragent
 go 1.27
 
 require (
+	github.com/creack/pty v1.1.24
 	github.com/gorilla/websocket v1.5.1
 	github.com/pion/webrtc/v4 v4.0.8
 	github.com/pkg/sftp v1.13.6

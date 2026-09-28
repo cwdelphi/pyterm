@@ -23,30 +23,31 @@ type Message struct {
 	Candidate  json.RawMessage `json:"candidate,omitempty"`
 	ICEServers json.RawMessage `json:"ice_servers,omitempty"`
 	Config     json.RawMessage `json:"config,omitempty"`
+	Detail     string          `json:"detail,omitempty"`
 	Timestamp  int64           `json:"timestamp,omitempty"`
 }
 
 // Client WebSocket客户端
 type Client struct {
-	url              string
-	token            string
-	agentID          string
-	conn             *websocket.Conn
-	mu               sync.RWMutex
-	done             chan struct{}
-	reconnectDelay   int
+	url               string
+	token             string
+	agentID           string
+	conn              *websocket.Conn
+	mu                sync.RWMutex
+	done              chan struct{}
+	reconnectDelay    int
 	heartbeatInterval int
-	onMessage        func(msg *Message)
-	onConnect        func()
-	onDisconnect     func()
-	setupMode        bool
-	setupCh          chan *Message
-	onSetupURL       func(url string)
-	onSetupToken     func(token string)
-	iceServers       []ICEServerConfig
-	heartbeatStop    chan struct{}
-	lastAckUnix      int64
-	missedAcks       int
+	onMessage         func(msg *Message)
+	onConnect         func()
+	onDisconnect      func()
+	setupMode         bool
+	setupCh           chan *Message
+	onSetupURL        func(url string)
+	onSetupToken      func(token string)
+	iceServers        []ICEServerConfig
+	heartbeatStop     chan struct{}
+	lastAckUnix       int64
+	missedAcks        int
 }
 
 // NewClient 创建新的WebSocket客户端
@@ -348,7 +349,7 @@ func (c *Client) reconnect() {
 			if delay > 60 {
 				delay = 60
 			}
-			jitter := time.Duration(float64(delay)*0.2*(float64(time.Now().UnixNano()%100)/50.0 - 1.0)) * time.Second
+			jitter := time.Duration(float64(delay)*0.2*(float64(time.Now().UnixNano()%100)/50.0-1.0)) * time.Second
 			sleepFor := time.Duration(delay)*time.Second + jitter
 			if sleepFor < time.Second {
 				sleepFor = time.Second
@@ -401,7 +402,7 @@ func (c *Client) SendSetupStart(agentName string) error {
 func (c *Client) SendConnectTunnel(targetAgentID string, token string) error {
 	data, _ := json.Marshal(map[string]string{
 		"target_agent_id": targetAgentID,
-		"token":          token,
+		"token":           token,
 	})
 	return c.Send(&Message{
 		Type:    "connect_tunnel",

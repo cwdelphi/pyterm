@@ -6,12 +6,13 @@ import { api, type AgentConfig } from "../api"
 const { t } = useI18n()
 
 const props = defineProps<{ agentId: string; agentName?: string; agentOnline?: boolean }>()
-const emit = defineEmits(["close"])
+const emit = defineEmits(["close", "updated", "token"])
 const toast = inject<any>("toast")
 
 const agentName = ref(props.agentName || "")
 const agentOnline = ref<boolean | undefined>(props.agentOnline)
 const allAgents = ref<any[]>([])
+const coturnList = ref<any[]>([])
 const config = ref<AgentConfig>({
   ws_reconnect_interval: 5,
   ws_heartbeat_interval: 30,
@@ -21,32 +22,65 @@ const config = ref<AgentConfig>({
 })
 const loading = ref(true)
 const saving = ref(false)
-const activeTab = ref<'basic' | 'tunnels'>('basic')
+const activeTab = ref<'info' | 'basic' | 'tunnels'>('info')
 const showCloseConfirm = ref(false)
+const showRegenConfirm = ref(false)
 const snapshot = ref("")
+const editForm = ref({ name: "", coturn_id: "", remark: "" })
+const editSnapshot = ref(JSON.stringify({ name: "", coturn_id: "", remark: "" }))
 
 const levels = ['debug', 'info', 'warn', 'error']
 const tunnelCount = computed(() => config.value.tunnels.length)
 
+function editPayloadOf() {
+  return {
+    name: editForm.value.name,
+    coturn_id: editForm.value.coturn_id,
+    remark: editForm.value.remark,
+  }
+}
+
+function mappedTunnels() {
+  return config.value.tunnels.map((tn: any) => ({
+    id: tn.id,
+    name: tn.name,
+    protocol: tn.protocol,
+    local_port: tn.local_port,
+    target_addr: tn.protocol === 'socks5' ? "" : joinTargetAddr(tn.target_host || "", tn.target_port || ""),
+    target_agent_id: tn.target_agent_id,
+    enabled: tn.enabled,
+    socks_username: tn.socks_username || "",
+    socks_password: tn.socks_password || "",
+  }))
+}
+
 function payloadOf() {
+  const all = mappedTunnels()
   return {
     ws_reconnect_interval: config.value.ws_reconnect_interval,
     ws_heartbeat_interval: config.value.ws_heartbeat_interval,
     ice_cooldown: config.value.ice_cooldown,
     log_level: config.value.log_level,
-    tunnels: config.value.tunnels.map((tn: any) => ({
-      id: tn.id,
-      name: tn.name,
-      protocol: tn.protocol,
-      local_port: tn.local_port,
-      target_addr: joinTargetAddr(tn.target_host || "", tn.target_port || ""),
-      target_agent_id: tn.target_agent_id,
-      enabled: tn.enabled,
-    })),
+    // 端到端插件协议: 按协议归桶存储, 不再发送顶层 tunnels(内嵌SSH服务已移除)
+    plugins: {
+      tunnel: { tunnels: all.filter((t: any) => t.protocol !== 'socks5') },
+      socks5: { tunnels: all.filter((t: any) => t.protocol === 'socks5') },
+    },
   }
 }
 
-const dirty = computed(() => !loading.value && JSON.stringify(payloadOf()) !== snapshot.value)
+// 渲染期求值：任何 payloadOf 异常都不能让弹窗被 Vue 卸载（异常在 save() 内仍会抛出并 toast）
+const configDirty = computed(() => {
+  if (loading.value) return false
+  try {
+    return JSON.stringify(payloadOf()) !== snapshot.value
+  } catch (e) {
+    console.error('[agentConfig] payloadOf failed:', e)
+    return false
+  }
+})
+const editDirty = computed(() => !loading.value && JSON.stringify(editPayloadOf()) !== editSnapshot.value)
+const dirty = computed(() => configDirty.value || editDirty.value)
 
 async function loadConfig() {
   loading.value = true
@@ -57,16 +91,35 @@ async function loadConfig() {
     if (agent) {
       if (!agentName.value) agentName.value = agent.name
       if (agentOnline.value === undefined) agentOnline.value = agent.online
+      editForm.value = {
+        name: agent.name || "",
+        coturn_id: agent.coturn_id || "",
+        remark: agent.remark || "",
+      }
+    } else {
+      editForm.value = { name: agentName.value, coturn_id: "", remark: "" }
+    }
+    editSnapshot.value = JSON.stringify(editPayloadOf())
+
+    try {
+      const coturnData = await api.adminListCoturn()
+      coturnList.value = coturnData.servers || []
+    } catch {
+      coturnList.value = []
     }
 
     const data = await api.adminGetAgentConfig(props.agentId)
     if (data.config) {
+      const plugins: any = (data.config as any).plugins || {}
+      // 新格式按插件桶取; 旧格式回退顶层 tunnels(md 已懒迁移, 双保险)
+      const rawList: any[] = (plugins.tunnel?.tunnels || []).concat(plugins.socks5?.tunnels || [])
+      const tunnelList = rawList.length ? rawList : (data.config.tunnels || [])
       config.value = {
         ws_reconnect_interval: data.config.ws_reconnect_interval ?? 5,
         ws_heartbeat_interval: data.config.ws_heartbeat_interval ?? 30,
         ice_cooldown: data.config.ice_cooldown ?? 2,
         log_level: data.config.log_level ?? "info",
-        tunnels: (data.config.tunnels || []).map((tn: any) => ({
+        tunnels: tunnelList.map((tn: any) => ({
           id: tn.id || crypto.randomUUID().slice(0, 8),
           name: tn.name || "",
           protocol: tn.protocol || "tcp",
@@ -75,6 +128,8 @@ async function loadConfig() {
           target_port: splitTargetPort(tn.target_addr || ""),
           target_agent_id: tn.target_agent_id || "",
           enabled: tn.enabled !== false,
+          socks_username: tn.socks_username || "",
+          socks_password: tn.socks_password || "",
         })),
       }
     }
@@ -95,12 +150,20 @@ function addTunnel() {
     target_port: "",
     target_agent_id: "",
     enabled: true,
+    socks_username: "",
+    socks_password: "",
   })
   activeTab.value = 'tunnels'
 }
 
 function removeTunnel(idx: number) {
   config.value.tunnels.splice(idx, 1)
+}
+
+function onProtocolChange(tn: any) {
+  if (tn.protocol === 'socks5' && !tn.local_port) {
+    tn.local_port = 2080
+  }
 }
 
 function splitTargetHost(addr: string): string {
@@ -121,9 +184,9 @@ function splitTargetPort(addr: string): string {
   return addr.slice(idx + 1)
 }
 
-function joinTargetAddr(host: string, port: string): string {
-  host = (host || "").trim()
-  port = (port || "").trim()
+function joinTargetAddr(host: unknown, port: unknown): string {
+  host = String(host ?? "").trim()
+  port = String(port ?? "").trim()
   if (!host) return port ? ":" + port : ""
   if (host.includes(":") && !host.startsWith("[")) host = "[" + host + "]"  // IPv6
   if (port) return host + ":" + port
@@ -133,14 +196,39 @@ function joinTargetAddr(host: string, port: string): string {
 async function save() {
   saving.value = true
   try {
-    await api.adminUpdateAgentConfig(props.agentId, payloadOf())
-    snapshot.value = JSON.stringify(payloadOf())
-    toast?.success(t('agentConfig.saveSuccess'))
+    if (editDirty.value) {
+      await api.adminUpdateAgent(props.agentId, {
+        name: editForm.value.name,
+        coturn_id: editForm.value.coturn_id,
+        remark: editForm.value.remark,
+      })
+      editSnapshot.value = JSON.stringify(editPayloadOf())
+      agentName.value = editForm.value.name
+      emit("updated", { name: editForm.value.name })
+    }
+    if (configDirty.value) {
+      await api.adminUpdateAgentConfig(props.agentId, payloadOf())
+      snapshot.value = JSON.stringify(payloadOf())
+      toast?.success(t('agentConfig.saveSuccess'))
+    } else if (editDirty.value) {
+      toast?.success(t('admin.updated'))
+    }
     emit("close")
   } catch (e: any) {
     toast?.error(e.message)
   }
   saving.value = false
+}
+
+async function regenerateToken() {
+  try {
+    const r = await api.adminRegenerateToken(props.agentId)
+    showRegenConfirm.value = false
+    toast?.success(t('admin.tokenRegenerated'))
+    emit("token", r.token)
+  } catch (e: any) {
+    toast?.error(e.message)
+  }
 }
 
 function requestClose() {
@@ -156,6 +244,7 @@ function confirmClose() {
 
 function onKeydown(e: KeyboardEvent) {
   if (e.key !== "Escape") return
+  if (showRegenConfirm.value) { showRegenConfirm.value = false; return }
   if (showCloseConfirm.value) { showCloseConfirm.value = false; return }
   requestClose()
 }
@@ -192,6 +281,9 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown))
 
         <!-- ── Tabs ── -->
         <div class="cfg-tabs">
+          <button class="cfg-tab" :class="{ active: activeTab === 'info' }" @click="activeTab = 'info'">
+            {{ t('agentConfig.tabInfo') }}
+          </button>
           <button class="cfg-tab" :class="{ active: activeTab === 'basic' }" @click="activeTab = 'basic'">
             {{ t('agentConfig.tabBasic') }}
           </button>
@@ -208,6 +300,41 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown))
           </div>
 
           <template v-else>
+            <!-- Tab0: 基本信息 -->
+            <div v-show="activeTab === 'info'" class="cfg-panel">
+              <div class="cfg-section-head">
+                <div>
+                  <h3>{{ t('agentConfig.tabInfo') }}</h3>
+                  <p>{{ t('agentConfig.tabInfoDesc') }}</p>
+                </div>
+              </div>
+              <div class="cfg-form">
+                <div class="cfg-form-row">
+                  <label>Agent ID</label>
+                  <input :value="agentId" readonly />
+                </div>
+                <div class="cfg-form-row">
+                  <label>{{ t('common.name') }}</label>
+                  <input v-model="editForm.name" :placeholder="t('admin.displayName')" />
+                </div>
+                <div class="cfg-form-row">
+                  <label>{{ t('admin.coturnServer') }}</label>
+                  <select v-model="editForm.coturn_id">
+                    <option value="">{{ t('admin.noCoturn') }}</option>
+                    <option v-for="c in coturnList" :key="c.id" :value="c.id">{{ c.name }}</option>
+                  </select>
+                </div>
+                <div class="cfg-form-row">
+                  <label>{{ t('admin.optionalRemark') }}</label>
+                  <input v-model="editForm.remark" :placeholder="t('admin.optionalRemark')" />
+                </div>
+              </div>
+              <div class="cfg-danger-zone">
+                <div class="cfg-danger-text">{{ t('admin.regenTokenWarning') }}</div>
+                <button class="btn danger" @click="showRegenConfirm = true">🔄 {{ t('admin.regenToken') }}</button>
+              </div>
+            </div>
+
             <!-- Tab1: 基础参数 -->
             <div v-show="activeTab === 'basic'" class="cfg-panel">
               <div class="cfg-section-head">
@@ -297,22 +424,35 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown))
                   <div class="cfg-tunnel-row">
                     <div class="cfg-tunnel-field">
                       <label>{{ t('agentConfig.protocol') }}</label>
-                      <select v-model="tn.protocol" class="cfg-field-select">
+                      <select v-model="tn.protocol" class="cfg-field-select" @change="onProtocolChange(tn)">
                         <option value="tcp">TCP</option>
                         <option value="udp">UDP</option>
+                        <option value="socks5">SOCKS5</option>
                       </select>
                     </div>
                     <div class="cfg-tunnel-field">
                       <label>{{ t('agentConfig.localPort') }}</label>
-                      <input v-model.number="tn.local_port" type="number" min="1" max="65535" placeholder="2222" />
+                      <input v-model.number="tn.local_port" type="number" min="1" max="65535" :placeholder="tn.protocol === 'socks5' ? '2080' : '2222'" />
                     </div>
-                    <div class="cfg-tunnel-field grow2">
-                      <label>{{ t('agentConfig.targetAddr') }}</label>
-                      <input v-model="tn.target_host" :placeholder="t('agentConfig.targetAddrPlaceholder')" />
+                    <template v-if="tn.protocol !== 'socks5'">
+                      <div class="cfg-tunnel-field grow2">
+                        <label>{{ t('agentConfig.targetAddr') }}</label>
+                        <input v-model="tn.target_host" :placeholder="t('agentConfig.targetAddrPlaceholder')" />
+                      </div>
+                      <div class="cfg-tunnel-field narrow">
+                        <label>{{ t('agentConfig.targetPort') }}</label>
+                        <input v-model.number="tn.target_port" type="number" min="1" max="65535" placeholder="22" />
+                      </div>
+                    </template>
+                  </div>
+                  <div class="cfg-tunnel-row" v-if="tn.protocol === 'socks5'">
+                    <div class="cfg-tunnel-field">
+                      <label>{{ t('agentConfig.socksAuth') }} <span class="cfg-label-muted">{{ t('agentConfig.socksAuthTip') }}</span></label>
+                      <input v-model="tn.socks_username" :placeholder="t('agentConfig.socksUser')" />
                     </div>
-                    <div class="cfg-tunnel-field narrow">
-                      <label>{{ t('agentConfig.targetPort') }}</label>
-                      <input v-model.number="tn.target_port" type="number" min="1" max="65535" placeholder="22" />
+                    <div class="cfg-tunnel-field">
+                      <label>{{ t('agentConfig.socksPass') }}</label>
+                      <input v-model="tn.socks_password" type="password" :placeholder="t('agentConfig.socksPass')" />
                     </div>
                   </div>
                   <div class="cfg-tunnel-row">
@@ -341,6 +481,18 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown))
             <button class="btn primary" :disabled="saving || loading" @click="save">
               {{ saving ? t('agentConfig.saving') : t('agentConfig.saveAndPush') }}
             </button>
+          </div>
+        </div>
+
+        <!-- ── 重新生成Token确认 ── -->
+        <div v-if="showRegenConfirm" class="cfg-confirm-mask" @click.self="showRegenConfirm = false">
+          <div class="cfg-confirm">
+            <div class="cfg-confirm-title">⚠️ {{ t('admin.regenToken') }}</div>
+            <p class="cfg-confirm-msg">{{ t('admin.regenTokenConfirm') }}<b>{{ agentName || agentId }}</b>{{ t('admin.regenTokenTip') }}{{ t('admin.regenTokenWarning') }}</p>
+            <div class="cfg-confirm-actions">
+              <button class="btn" @click="showRegenConfirm = false">{{ t('common.cancel') }}</button>
+              <button class="btn danger" @click="regenerateToken">{{ t('common.confirm') }}</button>
+            </div>
           </div>
         </div>
 
@@ -736,6 +888,54 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown))
 .cfg-tunnel-field input:focus,
 .cfg-field-select:focus { outline: none; border-color: var(--accent); }
 .cfg-field-select { appearance: auto; }
+
+/* ── 基本信息 ── */
+.cfg-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  max-width: 560px;
+}
+.cfg-form-row label {
+  display: block;
+  font-size: 12px;
+  color: var(--muted);
+  font-weight: 500;
+  margin-bottom: 4px;
+}
+.cfg-form-row input,
+.cfg-form-row select {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-2);
+  color: var(--fg);
+  font-size: 13px;
+  box-sizing: border-box;
+  appearance: auto;
+}
+.cfg-form-row input:focus,
+.cfg-form-row select:focus { outline: none; border-color: var(--accent); }
+.cfg-form-row input[readonly] {
+  color: var(--muted);
+  background: var(--panel);
+  cursor: not-allowed;
+  font-family: monospace;
+}
+.cfg-danger-zone {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  max-width: 560px;
+  margin-top: 22px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-2);
+}
+.cfg-danger-text { font-size: 12.5px; color: var(--muted); }
 
 /* ── Footer ── */
 .cfg-footer {

@@ -257,6 +257,22 @@ async def get_ice_servers_config(user: dict = Depends(get_current_user), db: Asy
     return {"ice_servers": get_ice_servers(user["id"])}
 
 
+class WebtermOpenReq(BaseModel):
+    agent_id: str = Field("", description="Agent ID")
+    agent_name: str = Field("", description="Agent 名称(审计展示)")
+
+
+@webrtc_router.post("/webterm-open")
+async def webterm_open(req: WebtermOpenReq, request: Request,
+                       user: dict = Depends(require_permission("ssh:manage")),
+                       db: AsyncSession = Depends(get_db)):
+    """webterm 控制台打开审计(N6: 可见即有 shell 权限, 打开动作留痕)"""
+    ip = request.client.host if request.client else ""
+    await log_audit(db, user["id"], user["username"], "agent.webterm_open",
+                    "agent", req.agent_id, req.agent_name, ip)
+    return {"ok": True}
+
+
 # ════════════════════════════════════════════════════════════
 #  Agent CRUD (admin)
 # ════════════════════════════════════════════════════════════
@@ -495,7 +511,70 @@ class AgentConfigReq(BaseModel):
     ws_heartbeat_interval: int = Field(30, ge=5, le=120, description="心跳间隔(秒)")
     ice_cooldown: int = Field(2, ge=0, le=30, description="ICE冷却时间(秒)")
     log_level: str = Field("info", description="日志级别(debug/info/warn/error)")
-    tunnels: list = Field(default=[], description="隧道配置列表")
+    tunnels: list = Field(default=[], description="[兼容]旧版隧道列表(plugins为空时按protocol拆分)")
+    plugins: dict = Field(default_factory=dict, description="插件配置字典 {tunnel,socks5}")
+
+
+_PLUGIN_KEYS = {"tunnel", "socks5"}
+
+
+def _strip_ssh_plugin(config: dict) -> dict:
+    """存量 plugins.ssh 键剥离(内嵌SSH服务已移除, 仅 webterm 本地控制台, 兼容旧数据回写)"""
+    plugins = config.get("plugins")
+    if isinstance(plugins, dict) and "ssh" in plugins:
+        out = dict(config)
+        out["plugins"] = {k: v for k, v in plugins.items() if k != "ssh"}
+        return out
+    return config
+
+
+def _validate_plugins(plugins: dict):
+    """插件字典校验: 键白名单 + 逐插件schema"""
+    if not plugins:
+        return
+    unknown = set(plugins.keys()) - _PLUGIN_KEYS
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"未知插件配置: {sorted(unknown)}")
+    for key, want_proto in (("tunnel", ("tcp", "udp")), ("socks5", ("socks5",))):
+        if key not in plugins:
+            continue
+        bucket = plugins[key]
+        if not isinstance(bucket, dict):
+            raise HTTPException(status_code=400, detail=f"plugins.{key} 必须是对象")
+        tl = bucket.get("tunnels") or []
+        if not isinstance(tl, list):
+            raise HTTPException(status_code=400, detail=f"plugins.{key}.tunnels 必须是列表")
+        for t in tl:
+            proto = t.get("protocol") or want_proto[0]
+            if proto not in want_proto:
+                raise HTTPException(status_code=400,
+                                    detail=f"plugins.{key} 不允许 protocol={proto}")
+            try:
+                lp = int(t.get("local_port") or 0)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="local_port 必须是整数")
+            if not (1 <= lp <= 65535):
+                raise HTTPException(status_code=400, detail=f"local_port 超出范围: {lp}")
+
+
+def _migrate_agent_config(config: dict) -> dict:
+    """旧 config_json(顶层tunnels) → plugins 结构(仅返回视图, 下次PUT落库)"""
+    if "plugins" not in config:
+        t_b, s_b = [], []
+        for t in (config.get("tunnels") or []):
+            (s_b if isinstance(t, dict) and t.get("protocol") == "socks5" else t_b).append(t)
+        out = dict(config)
+        out["plugins"] = {"tunnel": {"tunnels": t_b}, "socks5": {"tunnels": s_b}}
+        config = out
+    return _strip_ssh_plugin(config)
+
+
+def _split_tunnels_to_plugins(tunnels: list) -> dict:
+    """旧入参 tunnels → plugins 字典(兼容旧客户端PUT)"""
+    t_b, s_b = [], []
+    for t in (tunnels or []):
+        (s_b if isinstance(t, dict) and t.get("protocol") == "socks5" else t_b).append(t)
+    return {"tunnel": {"tunnels": t_b}, "socks5": {"tunnels": s_b}}
 
 
 @admin_router.get("/agents/{agent_id}/config")
@@ -510,7 +589,8 @@ async def admin_get_agent_config(agent_id: str, user: dict = Depends(require_per
             config = _json.loads(agent.config_json)
         except Exception:
             config = {}
-    return {"config": config}
+    # 旧格式懒迁移为 plugins 视图(不落库, 下次PUT转正)
+    return {"config": _migrate_agent_config(config)}
 
 
 @admin_router.put("/agents/{agent_id}/config")
@@ -521,16 +601,23 @@ async def admin_update_agent_config(agent_id: str, req: AgentConfigReq, request:
         raise HTTPException(status_code=404, detail="Agent not found")
     if agent.owner_id != user["id"]:
         raise HTTPException(status_code=403, detail=t("admin.no_operate_others_agent"))
+    plugins = req.plugins
+    if not plugins and req.tunnels:
+        # 兼容旧客户端: 仅传 tunnels → 拆分
+        plugins = _split_tunnels_to_plugins(req.tunnels)
+    # 存量 plugins.ssh 键接受并剥离(内嵌SSH服务已移除), 不报错并随落库回写清除
+    plugins = _strip_ssh_plugin({"plugins": plugins})["plugins"]
+    _validate_plugins(plugins)
     config = {
         "ws_reconnect_interval": req.ws_reconnect_interval,
         "ws_heartbeat_interval": req.ws_heartbeat_interval,
         "ice_cooldown": req.ice_cooldown,
         "log_level": req.log_level,
-        "tunnels": req.tunnels,
+        "plugins": plugins,
     }
     agent.config_json = _json.dumps(config, ensure_ascii=False)
     await db.commit()
-    # 推送配置到 Agent
+    # 推送配置到 Agent(_push_config_to_agent 自动附加 tunnels 镜像, 旧Agent兼容)
     from .api_isolated import _online_agents, _push_config_to_agent
     pushed = await _push_config_to_agent(agent_id, config)
     ip = request.client.host if request.client else ""

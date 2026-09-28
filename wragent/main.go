@@ -120,6 +120,8 @@ func runNormalMode(cfg *config.Config, configPath string) {
 
 		// 初始化隧道管理器，使 config_update 推送的隧道配置能被热部署
 		wrtc.InitTunnelManager(wsClient, signalHandler)
+		// 隧道看门狗(归属 tunnel 插件): 兜底 connect_tunnel 被拒/DC 未建立时的重试
+		wrtc.StartTunnelWatchdog(wsClient, 30*time.Second)
 
 		signalHandler.OnReady(func() {
 			log.Println("WebRTC连接准备就绪")
@@ -155,6 +157,7 @@ func runNormalMode(cfg *config.Config, configPath string) {
 		select {
 		case <-sigChan:
 			log.Println("收到中断信号，正在关闭...")
+			signalHandler.StopPlugins() // 优雅停止 tunnel/socks5 插件监听(阶段D)
 			return
 		case <-authFailed:
 			log.Println("正在重新认证...")

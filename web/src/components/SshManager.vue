@@ -5,8 +5,9 @@ import { api, type SshConn, getCurrentUser } from '../api'
 
 const { t } = useI18n()
 import SshFileBrowser from './SshFileBrowser.vue'
+import EmptyState from './EmptyState.vue'
 import VncViewer from './VncViewer.vue'
-import { WebRTCManager } from '../utils/webrtc'
+import { WebRTCManager, speedtestSubscribe, speedtestSend } from '../utils/webrtc'
 
 const toast = inject<any>('toast')
 const props = defineProps<{ view?: string }>()
@@ -35,7 +36,7 @@ const deleteTargetId = ref('')
 const deleteTargetName = ref('')
 const showPasswords = ref<Record<string, boolean>>({ password: false, vnc_password: false, rdp_password: false })
 function togglePassword(field: string) { showPasswords.value[field] = !showPasswords.value[field] }
-const agents = ref<{id: string; name: string; remark: string; is_active: number}[]>([])
+const agents = ref<{id: string; name: string; remark: string; is_active: number; online?: boolean}[]>([])
 const gateways = ref<{id: string; name: string; url: string; remark: string; is_active: number}[]>([])
 
 /* ── 分组折叠状态 ── */
@@ -106,7 +107,11 @@ onMounted(async () => {
     if (c) openSshTab(c)
   }) as EventListener)
 })
-onBeforeUnmount(() => { tabs.value.forEach((t) => closeTerm(t.id)) })
+onBeforeUnmount(() => {
+  tabs.value.forEach((t) => closeTerm(t.id))
+  if (stUnsub) { stUnsub(); stUnsub = null }
+  stopStTimer()
+})
 
 async function loadAgents() {
   try { const data = await api.adminListAgents(); agents.value = data.agents } catch {}
@@ -175,6 +180,134 @@ function resolveGatewayIp(conn: SshConn): string {
 /* ── 连接 ── */
 function openSshTab(conn: SshConn) { connectSshWithMode(conn) }
 function openFileTab(conn: SshConn) { connectFileWithMode(conn) }
+
+/* ── webterm: Agent 本地 shell 控制台(免SSH服务, 首帧 mode=local) ── */
+function openWebtermTab(agent: { id: string; name: string; online?: boolean }) {
+  if (!agent.online) { toast?.error(t('ssh.agentOffline')); return }
+  const webtermId = `webterm-${agent.id}`
+  const existing = tabs.value.find(x => x.conn.id === webtermId && x.type !== 'filemanager')
+  if (existing) { activeTab.value = existing.id; return }
+  // 打开留痕(N6: 可见即有 shell 权限)
+  api.auditWebtermOpen(agent.id, agent.name).catch(() => {})
+  const conn: SshConn = {
+    id: webtermId, name: agent.name, host: '', port: 0, username: '',
+    auth_type: 'none', connection_mode: 'agent', agent_id: agent.id,
+    connection_type: 'ssh', mode: 'local',
+  }
+  connectSshWithMode(conn)
+}
+
+/* ── 测速(Agent↔Agent P2P 独立DC, 阶段S) ── */
+const showSpeedtest = ref(false)
+const stSrc = ref('')
+const stTarget = ref('')
+const stLimit = ref(10)
+const stPhase = ref<'idle' | 'running' | 'done' | 'error'>('idle')
+const stSub = ref('up')
+const stMbps = ref(0)
+const stUp = ref(0)
+const stDown = ref(0)
+const stError = ref('')
+const stRoom = ref('')
+const stHistory = ref<Array<{ source: string; target: string; up_mbps: number; down_mbps: number; duration: number; finished_at: number }>>([])
+const stPct = ref(0)
+let stUnsub: (() => void) | null = null
+let stTimer: ReturnType<typeof setInterval> | null = null
+let stStartedAt = 0
+
+const stTargets = computed(() => agents.value.filter(a => a.online && a.id !== stSrc.value))
+
+function stopStTimer() { if (stTimer) { clearInterval(stTimer); stTimer = null } }
+function agentNameOf(id: string) { return agents.value.find(a => a.id === id)?.name || id }
+function fmtStTime(ts: number) {
+  if (!ts) return ''
+  const d = new Date(ts * 1000)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+function openSpeedtest(a: { id: string; name: string; online?: boolean }) {
+  if (!a.online) { toast?.error(t('ssh.agentOffline')); return }
+  stSrc.value = a.id
+  stTarget.value = agents.value.find(x => x.online && x.id !== a.id)?.id || ''
+  stPhase.value = 'idle'; stError.value = ''; stRoom.value = ''
+  stPct.value = 0; stMbps.value = 0
+  showSpeedtest.value = true
+  if (!stUnsub) stUnsub = speedtestSubscribe(onSpeedtestMsg)
+  loadSpeedtestHistory()
+}
+
+function closeSpeedtest() {
+  if (stPhase.value === 'running' && stRoom.value) speedtestSend({ type: 'speedtest_cancel', room_id: stRoom.value })
+  if (stUnsub) { stUnsub(); stUnsub = null }
+  stopStTimer()
+  showSpeedtest.value = false
+}
+
+async function loadSpeedtestHistory() {
+  try { const d = await api.speedtestHistory(); stHistory.value = d.history || [] } catch {}
+}
+
+function startSpeedtest() {
+  if (!stTarget.value) { toast?.error(t('ssh.stNoTarget')); return }
+  const token = localStorage.getItem('token')
+  if (!token) { toast?.error(t('ssh.notLoggedIn')); return }
+  stPhase.value = 'running'; stSub.value = 'up'; stError.value = ''
+  stUp.value = 0; stDown.value = 0; stPct.value = 0; stRoom.value = ''
+  stMbps.value = 0
+  stStartedAt = Date.now()
+  stopStTimer()
+  stTimer = setInterval(() => { stPct.value = Math.min(99, ((Date.now() - stStartedAt) / 20000) * 100) }, 400)
+  const payload = { type: 'speedtest_start', source: stSrc.value, target: stTarget.value, mbps_limit: stLimit.value, token }
+  // 信令 ws 可能仍在连接中(弹层刚打开即点开始): 发送失败退避重试一次
+  if (!speedtestSend(payload)) {
+    setTimeout(() => {
+      if (!speedtestSend(payload) && stPhase.value === 'running' && !stRoom.value) {
+        stPhase.value = 'error'
+        stError.value = t('ssh.stError')
+        stopStTimer()
+      }
+    }, 800)
+  }
+}
+
+function cancelSpeedtest() {
+  if (stRoom.value) speedtestSend({ type: 'speedtest_cancel', room_id: stRoom.value })
+}
+
+function onSpeedtestMsg(msg: any) {
+  if (!showSpeedtest.value) return
+  switch (msg.type) {
+    case 'speedtest_started':
+      stRoom.value = msg.room_id || ''
+      stPhase.value = 'running'
+      break
+    case 'speedtest_progress':
+      if (stRoom.value && msg.room_id && msg.room_id !== stRoom.value) return
+      stSub.value = msg.phase || 'up'
+      stMbps.value = msg.mbps || 0
+      break
+    case 'speedtest_result':
+      if (stRoom.value && msg.room_id && msg.room_id !== stRoom.value) return
+      stUp.value = msg.up_mbps || 0
+      stDown.value = msg.down_mbps || 0
+      stPhase.value = 'done'
+      stPct.value = 100
+      stopStTimer()
+      loadSpeedtestHistory()
+      break
+    case 'speedtest_error':
+      stPhase.value = 'error'
+      stError.value = msg.detail || t('ssh.stError')
+      stRoom.value = ''
+      stopStTimer()
+      break
+    case 'speedtest_cancelled':
+    case 'speedtest_stop':
+      if (stPhase.value === 'running') { stPhase.value = 'idle'; stRoom.value = ''; stopStTimer() }
+      break
+  }
+}
 
 function connectSshWithMode(conn: SshConn) {
   loadXterm().then(() => {
@@ -262,8 +395,9 @@ function connectWebRTC(tabId: string, conn: SshConn, term: any) {
       const tab = tabs.value.find(t => t.id === tabId)
       if (tab && tab.status === 'connecting') tab.status = 'connected'
       let pw = conn.password || ''
-      if (!pw && conn.id) { try { const r = await api.sshGetPassword(conn.id); pw = r.password || '' } catch {} }
-      webrtc.sendSshConnect({ host: conn.host, port: conn.port, username: conn.username, auth_type: conn.auth_type, password: pw }, term.cols, term.rows)
+      // webterm(mode=local) 无凭据: 跳过密码获取
+      if (!pw && conn.id && conn.mode !== 'local') { try { const r = await api.sshGetPassword(conn.id); pw = r.password || '' } catch {} }
+      webrtc.sendSshConnect({ host: conn.host, port: conn.port, username: conn.username, auth_type: conn.auth_type, password: pw, mode: conn.mode }, term.cols, term.rows)
     })
     let _termBuf: Uint8Array[] = []; let _termRaf = 0; let _termBufBytes = 0; let _termDisposed = false
     const _flushTerm = () => {
@@ -441,6 +575,25 @@ function typeLabel(t: string) {
       </div>
       <div class="ssh-list">
         <!-- SSH/FILE 分组 -->
+        <!-- 固定 Agent 分组(webterm 控制台: 单击直开, 不可删/不可排序) -->
+        <div class="conn-group agent-group">
+          <div class="group-header" @click="toggleGroup('agents')">
+            <span class="group-arrow" :class="{ expanded: !collapsedGroups.has('agents') }">▸</span>
+            <span class="group-label">{{ t('ssh.agentGroup') }} ({{ agents.length }})</span>
+          </div>
+          <div v-if="!collapsedGroups.has('agents')" class="group-items">
+            <div v-for="a in agents" :key="a.id" class="agent-card"
+                 :class="{ offline: !a.online }"
+                 :title="a.online ? t('ssh.webterm') : t('ssh.agentOffline')"
+                 @click="openWebtermTab(a)">
+              <span class="si-dot" :class="{ online: tabs.some(x => x.conn.id === 'webterm-' + a.id && x.status === 'connected') }"></span>
+              <span class="agent-card-name">{{ a.name }}</span>
+              <span v-if="a.remark" class="agent-card-remark">{{ a.remark }}</span>
+              <button v-if="a.online" class="st-btn" :title="t('ssh.speedtest')" @click.stop="openSpeedtest(a)">⚡</button>
+            </div>
+            <EmptyState v-if="!agents.length" icon="🤖" :title="t('ssh.noAgents')" />
+          </div>
+        </div>
         <div v-if="groupedConns.ssh.length || !collapsedGroups.has('ssh')" class="conn-group">
           <div class="group-header" @click="toggleGroup('ssh')">
             <span class="group-arrow" :class="{ expanded: !collapsedGroups.has('ssh') }">▸</span>
@@ -765,6 +918,75 @@ function typeLabel(t: string) {
       </div>
     </Teleport>
 
+    <!-- 测速弹层(Agent↔Agent P2P 独立DC, 阶段S) -->
+    <Teleport to="body">
+      <div v-if="showSpeedtest" class="modal-mask" @click.self="closeSpeedtest()">
+        <div class="modal-box st-box">
+          <h3>{{ t('ssh.speedtest') }}<span class="st-src-name">{{ agentNameOf(stSrc) }}</span></h3>
+          <div class="st-controls">
+            <div class="st-field">
+              <label>{{ t('ssh.stTarget') }}</label>
+              <select v-model="stTarget" :disabled="stPhase === 'running'">
+                <option v-if="!stTargets.length" value="">{{ t('ssh.stNoTarget') }}</option>
+                <option v-for="a in stTargets" :key="a.id" :value="a.id">{{ a.name }}</option>
+              </select>
+            </div>
+            <div class="st-field">
+              <label>{{ t('ssh.stLimit') }}</label>
+              <select v-model.number="stLimit" :disabled="stPhase === 'running'">
+                <option :value="10">10 Mbps</option>
+                <option :value="50">50 Mbps</option>
+                <option :value="100">100 Mbps</option>
+                <option :value="0">{{ t('ssh.stUnlimited') }}</option>
+              </select>
+            </div>
+            <button v-if="stPhase !== 'running'" class="btn primary" :disabled="!stTarget" @click="startSpeedtest">{{ t('ssh.stStart') }}</button>
+            <button v-else class="btn danger" @click="cancelSpeedtest">{{ t('ssh.stCancel') }}</button>
+          </div>
+          <div class="st-stage" :class="stPhase">
+            <template v-if="stPhase === 'running'">
+              <div class="st-bar"><div class="st-bar-fill" :style="{ width: stPct + '%' }"></div></div>
+              <div class="st-live">{{ stSub === 'down' ? t('ssh.stDown') : t('ssh.stUp') }} <b>{{ stMbps.toFixed(1) }}</b> Mbps</div>
+            </template>
+            <div v-else-if="stPhase === 'error'" class="st-err">⚡ {{ stError }}</div>
+            <div v-else-if="stPhase === 'done'" class="st-result">
+              <div class="st-res-card">
+                <span class="st-res-label">↑ {{ t('ssh.stUp') }}</span>
+                <span class="st-res-val">{{ stUp.toFixed(1) }}</span>
+                <span class="st-res-unit">Mbps</span>
+              </div>
+              <div class="st-res-card">
+                <span class="st-res-label">↓ {{ t('ssh.stDown') }}</span>
+                <span class="st-res-val">{{ stDown.toFixed(1) }}</span>
+                <span class="st-res-unit">Mbps</span>
+              </div>
+            </div>
+            <div v-else class="st-idle">{{ t('ssh.stReady') }}</div>
+          </div>
+          <div class="st-history">
+            <div class="st-hist-title">{{ t('ssh.stHistory') }}</div>
+            <div class="st-hist-list">
+              <table v-if="stHistory.length" class="st-table">
+                <thead>
+                  <tr><th>{{ t('ssh.stSrc') }}</th><th>{{ t('ssh.stTarget') }}</th><th>↑ {{ t('ssh.stUp') }}</th><th>↓ {{ t('ssh.stDown') }}</th><th>{{ t('ssh.stTime') }}</th></tr>
+                </thead>
+                <tbody>
+                  <tr v-for="(h, i) in stHistory" :key="i">
+                    <td :title="h.source">{{ agentNameOf(h.source) }}</td>
+                    <td :title="h.target">{{ agentNameOf(h.target) }}</td>
+                    <td>{{ Number(h.up_mbps || 0).toFixed(1) }}</td>
+                    <td>{{ Number(h.down_mbps || 0).toFixed(1) }}</td>
+                    <td>{{ fmtStTime(h.finished_at) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+              <EmptyState v-else icon="⚡" :title="t('ssh.stEmpty')" />
+            </div>
+          </div>
+        </div>
+      </div>
+    </Teleport>
+
     <!-- 删除确认弹窗 -->
     <Teleport to="body">
       <div v-if="showDeleteConfirm" class="modal-mask" @click.self="showDeleteConfirm = false">
@@ -802,6 +1024,44 @@ function typeLabel(t: string) {
 .group-arrow.expanded { transform:rotate(90deg); }
 .group-label { font-size:12px; font-weight:600; color:var(--muted); text-transform:uppercase; letter-spacing:.03em; }
 .group-items { display:flex; flex-direction:column; gap:4px; padding:0 0 4px; }
+.agent-card { display:flex; align-items:center; gap:8px; padding:8px 10px; border:1px solid var(--border); border-radius:8px; background:var(--panel-2); cursor:pointer; }
+.agent-card:hover { border-color:var(--accent, #2563eb); }
+.agent-card.offline { opacity:.55; cursor:not-allowed; }
+.agent-card-name { flex:1; font-size:13px; font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.agent-card-remark { font-size:11px; color:var(--muted); max-width:88px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.agent-group :deep(.page-empty) { padding:10px 6px; text-align:center; }
+.agent-group :deep(.empty-icon) { font-size:22px; margin-bottom:4px; }
+.agent-group :deep(.empty-title) { font-size:12px; }
+.st-btn { flex-shrink:0; border:1px solid var(--border); background:var(--panel); border-radius:6px; font-size:11px; padding:2px 6px; cursor:pointer; line-height:1.4; color:var(--fg-2); }
+.st-btn:hover { border-color:var(--accent, #2563eb); color:var(--fg); }
+.st-box { width:560px; display:flex; flex-direction:column; gap:12px; }
+.st-src-name { font-size:13px; color:var(--muted); margin-left:8px; font-weight:400; }
+.st-controls { display:flex; gap:8px; align-items:flex-end; flex-wrap:wrap; }
+.st-controls .btn { height:34px; padding:0 14px; }
+.st-field { display:flex; flex-direction:column; gap:4px; flex:1; min-width:150px; }
+.st-field label { font-size:12px; color:var(--muted); }
+.st-field select { padding:6px 8px; border:1px solid var(--border); border-radius:6px; background:var(--panel-2); color:var(--fg); font-size:13px; }
+.st-stage { min-height:72px; display:flex; flex-direction:column; justify-content:center; gap:8px; padding:10px 12px; border:1px dashed var(--border); border-radius:8px; }
+.st-stage.running { border-style:solid; border-color:var(--accent, #2563eb); }
+.st-bar { height:8px; background:var(--panel-2); border-radius:4px; overflow:hidden; }
+.st-bar-fill { height:100%; background:var(--accent, #2563eb); transition:width .4s; }
+.st-live { font-size:13px; color:var(--fg-2); text-align:center; }
+.st-live b { color:var(--fg); font-size:15px; }
+.st-result { display:flex; gap:12px; }
+.st-res-card { flex:1; display:flex; flex-direction:column; align-items:center; gap:2px; padding:8px; background:var(--panel-2); border-radius:8px; }
+.st-res-label { font-size:12px; color:var(--muted); }
+.st-res-val { font-size:22px; font-weight:600; color:var(--fg); line-height:1.2; }
+.st-res-unit { font-size:11px; color:var(--muted); }
+.st-err { color:#ef4444; font-size:13px; text-align:center; }
+.st-idle { font-size:13px; color:var(--muted); text-align:center; }
+.st-history { flex:1; min-height:120px; display:flex; flex-direction:column; gap:6px; }
+.st-hist-title { font-size:12px; color:var(--muted); }
+.st-hist-list { flex:1; min-height:100px; max-height:220px; overflow:auto; border:1px solid var(--border); border-radius:8px; }
+.st-table { width:100%; border-collapse:collapse; font-size:12px; }
+.st-table th, .st-table td { padding:6px 8px; text-align:left; border-bottom:1px solid var(--border); white-space:nowrap; }
+.st-table th { color:var(--muted); font-weight:500; position:sticky; top:0; background:var(--panel); z-index:1; }
+.st-table td { color:var(--fg-2); max-width:130px; overflow:hidden; text-overflow:ellipsis; }
+.st-hist-list .page-empty { padding:14px 8px; }
 .ssh-card-main { display:flex; align-items:center; justify-content:space-between; padding:8px 10px; cursor:pointer; gap:6px; min-height:48px; }
 .ssh-card-left { display:flex; align-items:center; gap:8px; min-width:0; flex:1; }
 .type-bar { width:3px; height:28px; border-radius:2px; flex-shrink:0; }
