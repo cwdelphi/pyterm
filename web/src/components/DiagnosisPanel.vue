@@ -14,6 +14,7 @@ const currentPage = ref(1)
 const pageSize = 10
 const loading = ref(false)
 const filterType = ref('')
+const pathFilter = ref('')        // DC 链路筛选：P2P / relay / BUG / none(未检测)
 const searchQuery = ref('')
 const selectedRecord = ref<any>(null)
 const timelineDetail = ref<any>(null)
@@ -40,6 +41,7 @@ async function loadRecords() {
     const res = await api.timelineRecords({
       page: currentPage.value, page_size: pageSize,
       conn_type: filterType.value || undefined,
+      webrtc_path: pathFilter.value || undefined,
       search: searchQuery.value || undefined,
     })
     records.value = res.items || []
@@ -163,6 +165,23 @@ function pathModeLabel(m: string) {
   if (m === 'direct') return t('diagnosis.directConn')
   return m || '-'
 }
+// DC 链路标注：P2P(打洞直连) / relay(coturn 中继) / BUG(检测失败) / 空(未检测)
+function wpLabel(p?: string) {
+  if (p === 'P2P') return 'P2P'
+  if (p === 'relay') return 'Relay'
+  if (p === 'BUG') return 'BUG'
+  return '-'
+}
+function wpBadgeClass(p?: string) {
+  if (p === 'P2P') return 'dp-p2p'
+  if (p === 'relay') return 'dp-relay'
+  if (p === 'BUG') return 'dp-bug'
+  return 'dp-wp-none'
+}
+// DC 链路语义按 path_mode 区分：直连=浏览器↔Agent；网关=网关↔Agent（浏览器经 WSS 连网关）
+function wpHint(pathMode?: string) {
+  return pathMode === 'gateway' ? t('diagnosis.wpHintGateway') : t('diagnosis.wpHintDirect')
+}
 
 onMounted(() => { loadRecords(); loadStats() })
 </script>
@@ -182,13 +201,20 @@ onMounted(() => { loadRecords(); loadStats() })
         <option value="vnc">VNC</option>
         <option value="rdp">RDP</option>
       </select>
+      <select v-model="pathFilter" @change="currentPage = 1; loadRecords()">
+        <option value="">{{ t('diagnosis.allPaths') }}</option>
+        <option value="P2P">{{ t('diagnosis.pathFilterP2P') }}</option>
+        <option value="relay">{{ t('diagnosis.pathFilterRelay') }}</option>
+        <option value="BUG">{{ t('diagnosis.pathFilterBug') }}</option>
+        <option value="none">{{ t('diagnosis.pathFilterUnknown') }}</option>
+      </select>
       <input v-model="searchQuery" :placeholder="t('diagnosis.searchPlaceholder')" @keyup.enter="currentPage = 1; loadRecords()" />
       <button @click="currentPage = 1; loadRecords()">{{ t('diagnosis.searchPlaceholder') }}</button>
     </div>
     <div class="dp-card">
       <table class="dp-table">
         <thead><tr>
-          <th>#</th><th>{{ t('diagnosis.colName') }}</th><th>{{ t('diagnosis.colType') }}</th><th>{{ t('diagnosis.colInitType') }}</th><th>{{ t('diagnosis.colTarget') }}</th><th>{{ t('diagnosis.colGateway') }}</th><th>{{ t('diagnosis.colStatus') }}</th><th>{{ t('diagnosis.colDuration') }}</th><th>{{ t('diagnosis.colDate') }}</th><th>{{ t('diagnosis.colAction') }}</th>
+          <th>#</th><th>{{ t('diagnosis.colName') }}</th><th>{{ t('diagnosis.colType') }}</th><th>{{ t('diagnosis.colInitType') }}</th><th>{{ t('diagnosis.colTarget') }}</th><th>{{ t('diagnosis.colGateway') }}</th><th>{{ t('diagnosis.colWebrtcPath') }}</th><th>{{ t('diagnosis.colStatus') }}</th><th>{{ t('diagnosis.colDuration') }}</th><th>{{ t('diagnosis.colDate') }}</th><th>{{ t('diagnosis.colAction') }}</th>
         </tr></thead>
         <tbody>
           <tr v-for="r in records" :key="r.id">
@@ -198,19 +224,20 @@ onMounted(() => { loadRecords(); loadStats() })
             <td>{{ browserLabel(r.browser) }}</td>
             <td>{{ r.host }}:{{ r.port }}</td>
             <td><small>{{ pathModeLabel(r.path_mode) }}{{ r.gateway_ip ? ' · ' + r.gateway_ip : '' }}</small></td>
+            <td><span class="dp-badge" :class="wpBadgeClass(r.webrtc_path)" :title="wpHint(r.path_mode)">{{ wpLabel(r.webrtc_path) }}</span></td>
             <td :class="r.success ? 'dp-ok' : 'dp-fail'">{{ r.success ? t('common.success') : t('common.failed') }}</td>
             <td>{{ fmtMs(r.duration_total) }}</td>
             <td><small>{{ r.created_at }}</small></td>
             <td><button class="dp-link" @click="viewTimeline(r)">{{ t('diagnosis.viewTimeline') }}</button></td>
           </tr>
-          <tr v-if="!records.length"><td colspan="10" class="dp-empty">{{ t('diagnosis.noRecords') }}</td></tr>
+          <tr v-if="!records.length"><td colspan="11" class="dp-empty">{{ t('diagnosis.noRecords') }}</td></tr>
         </tbody>
       </table>
-      <div v-if="totalPages > 1" class="dp-pagination">
+      <div class="dp-pagination">
         <button :disabled="currentPage <= 1" @click="goToPage(currentPage - 1)">&#8249; {{ t('common.prev') }}</button>
         <button v-for="p in pageNumbers" :key="p" :class="{ active: p === currentPage }" @click="goToPage(p)">{{ p }}</button>
         <button :disabled="currentPage >= totalPages" @click="goToPage(currentPage + 1)">{{ t('common.next') }} &#8250;</button>
-        <span class="dp-page-info">{{ t('diagnosis.pageTotal', { n: totalRecords }) }}</span>
+        <span class="dp-page-info">{{ t('diagnosis.pageTotal', { n: totalRecords, p: totalPages }) }}</span>
       </div>
     </div>
   </div>
@@ -224,6 +251,7 @@ onMounted(() => { loadRecords(); loadStats() })
         <span class="dp-badge">{{ timelineDetail?.conn_type }}</span>
         <span>{{ timelineDetail?.host }}:{{ timelineDetail?.port }}</span>
         <span>{{ pathModeLabel(timelineDetail?.path_mode) }}</span>
+        <span class="dp-badge" :class="wpBadgeClass(timelineDetail?.webrtc_path)" :title="wpHint(timelineDetail?.path_mode)">{{ wpLabel(timelineDetail?.webrtc_path) }}</span>
         <span :class="timelineDetail?.success ? 'dp-ok' : 'dp-fail'">{{ timelineDetail?.success ? t('common.success') : t('common.failed') }}</span>
         <span v-if="timelineDetail?.duration_total">{{ t('diagnosis.totalDuration') }}: {{ fmtMs(timelineDetail.duration_total) }}</span>
       </div>
@@ -281,6 +309,11 @@ onMounted(() => { loadRecords(); loadStats() })
       <div class="dp-stat-card"><div class="dp-stat-val">{{ stats.success_rate }}%</div><div class="dp-stat-label">{{ t('diagnosis.successRate') }}</div></div>
       <div class="dp-stat-card"><div class="dp-stat-val">{{ stats.avg_total }}ms</div><div class="dp-stat-label">{{ t('diagnosis.avgDuration') }}</div></div>
       <div class="dp-stat-card"><div class="dp-stat-val">{{ stats.fail_count }}</div><div class="dp-stat-label">{{ t('diagnosis.failCount') }}</div></div>
+      <div class="dp-stat-card">
+        <div class="dp-stat-val">{{ stats.p2p_rate ?? 0 }}%</div>
+        <div class="dp-stat-label">{{ t('diagnosis.p2pRate') }}</div>
+        <div class="dp-stat-sub">P2P {{ stats.p2p_count ?? 0 }} · Relay {{ stats.relay_count ?? 0 }}</div>
+      </div>
     </div>
     <div v-else class="dp-card dp-empty">{{ t('common.loading') }}</div>
   </div>
@@ -329,6 +362,11 @@ onMounted(() => { loadRecords(); loadStats() })
 .dp-stat-val { font-size: 28px; font-weight: 700; color: var(--accent); }
 .dp-stat-label { font-size: 13px; color: var(--muted); margin-top: 4px; }
 .dp-badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; background: var(--accent-soft, #e8f0fe); color: var(--accent); font-weight: 600; text-transform: uppercase; }
+.dp-badge.dp-p2p { background: #dcfce7; color: #16a34a; }
+.dp-badge.dp-relay { background: #ffedd5; color: #ea580c; }
+.dp-badge.dp-bug { background: #fee2e2; color: #dc2626; }
+.dp-badge.dp-wp-none { background: var(--panel-2, #f1f5f9); color: var(--muted); }
+.dp-stat-sub { font-size: 11px; color: var(--muted); margin-top: 6px; }
 .dp-ok { color: #16a34a; font-weight: 600; }
 .dp-fail { color: #dc2626; font-weight: 600; }
 .dp-partial { color: #d97706; font-weight: 600; }

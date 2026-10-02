@@ -100,6 +100,73 @@ export interface AgentPluginsConfig {
   socks5?: { tunnels: TunnelConfig[] }
 }
 
+/** ICE 优化规则 —— config_json.ice（方案 §4.1） */
+export interface AgentIceConfig {
+  enabled: boolean
+  mode: 'auto' | 'custom' | 'blacklist' | 'off'
+  keep: string[]
+  drop_prefix: string[]
+  allow_tailscale: boolean
+  auto_fallback?: boolean
+  path_cache?: boolean
+  conn_reuse?: boolean
+}
+
+/** Agent 上报的网络接口清单 —— config_json.net_info（只读） */
+export interface AgentNetInfo {
+  if_hash?: string
+  scanned_at?: string
+  valid?: boolean
+  reason?: string
+  interfaces?: Array<{
+    name: string
+    state: string
+    mtu?: number
+    addrs?: string[]
+    is_default?: boolean
+    score?: number
+    keep?: boolean
+    hard_drop?: boolean
+    reason?: string
+    addr_count?: number
+  }>
+  rule?: Partial<AgentIceConfig>
+  host_before?: number
+  host_after?: number
+  addr_before?: number
+  addr_after?: number
+  est_candidates_before?: number
+  est_candidates_after?: number
+  est_pairs_before?: number
+  est_pairs_after?: number
+  /** P2 §4.5: 最近一次建连胜出的本端接口 */
+  last_pair?: {
+    local_iface: string
+    conn_type?: string
+    if_hash?: string
+    level?: number
+    at?: number
+  }
+  /** P2 §4.5: 三级回退阶梯自统计（Agent 从每次 offer 观察） */
+  ladder?: {
+    level?: number
+    fallbacks?: number
+    l3?: number
+    cache_hits?: number
+    at?: number
+  }
+  /** P2 §4.5: 路径缓存条目（键=对端标识, 30 分钟 TTL, if_hash 变化即失效） */
+  path_cache?: Array<{
+    key: string
+    local_iface: string
+    if_hash?: string
+    conn_type?: string
+    rtt_ms?: number
+    hits?: number
+    updated_at?: number
+  }>
+}
+
 export interface AgentConfig {
   ws_reconnect_interval: number
   ws_heartbeat_interval: number
@@ -107,6 +174,8 @@ export interface AgentConfig {
   log_level: string
   tunnels: TunnelConfig[]
   plugins?: AgentPluginsConfig
+  ice?: AgentIceConfig
+  net_info?: AgentNetInfo
 }
 
 export interface AgentConfigPayload {
@@ -115,6 +184,9 @@ export interface AgentConfigPayload {
   ice_cooldown: number
   log_level: string
   plugins: AgentPluginsConfig
+  ice?: AgentIceConfig
+  /** P2: 清空 Agent 路径缓存（仅随本次推送，不落库） */
+  ice_cache_clear?: boolean
 }
 
 export interface AuditLog {
@@ -322,6 +394,8 @@ export const api = {
     getJSON('/api/admin/agents/' + agentId + '/config'),
   adminUpdateAgentConfig: (agentId: string, config: AgentConfigPayload): Promise<{ok: boolean}> =>
     postJSON('/api/admin/agents/' + agentId + '/config', config, true, 'PUT'),
+  adminScanAgentIce: (agentId: string): Promise<{ok: boolean; net_info?: AgentNetInfo}> =>
+    postJSON('/api/admin/agents/' + agentId + '/ice-scan', {}, true),
   
   /* ── Admin Agent CRUD ── */
   adminNextAgentId: (): Promise<{ id: string }> =>
@@ -348,6 +422,8 @@ export const api = {
     `/api/deploy/agent?method=${method}&id=${agentId}`,
   deployAgentSignedUrl: (method: string, agentId: string): Promise<{url: string; expires_in: number}> =>
     postJSON('/api/deploy/agent/signed-url', { method, id: agentId }),
+  deployAgentShort: (agentId: string): Promise<{code: string; path_docker: string; path_systemd: string; expires_in: number}> =>
+    postJSON('/api/deploy/agent/short', { method: 'docker', id: agentId }),
   adminPendingAgents: (): Promise<{ pending: Array<{sid: string; agent_id: string; agent_name: string; created_at: number}> }> =>
     getJSON('/api/admin/agents/pending'),
   approvePendingAgent: (sid: string): Promise<{ok: boolean; agent_id: string}> =>
@@ -394,6 +470,9 @@ export const api = {
     getJSON('/api/admin/roles'),
   adminMyPermissions: (): Promise<{ role: string; permissions: string[]; all_permissions: Record<string, string> }> =>
     getJSON('/api/admin/me/permissions'),
+  /* 指定共享的候选名单（仅 id+username，agent:manage 即可调用，排除自己） */
+  adminShareableUsers: (): Promise<{ users: Array<{ id: string; username: string }> }> =>
+    getJSON('/api/admin/shareable-users'),
 
   /* ── Admin 审计日志 ── */
   adminAuditLog: (): Promise<{ logs: AuditLog[] }> =>

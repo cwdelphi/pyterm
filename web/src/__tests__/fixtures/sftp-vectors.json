@@ -1,0 +1,92 @@
+{
+  "version": 1,
+  "desc": "SFTP 二进制帧跨语言向量。web/src/utils/frame.ts 与 pyagent/webrtc/signal.go 必须逐字节一致；任一侧改动编解码须同步更新本文件，两个测试会互相校验。",
+  "vectors": [
+    {
+      "name": "cmd_list",
+      "kind": "cmd",
+      "frameType": 16,
+      "payloadHex": "000100000001000c7b2270617468223a222f227d",
+      "op": 1,
+      "opName": "list",
+      "reqId": 1,
+      "metaJson": "{\"path\":\"/\"}"
+    },
+    {
+      "name": "cmd_write_chunks",
+      "kind": "cmd",
+      "frameType": 16,
+      "payloadHex": "00030102030400207b2270617468223a222f746d702f612e747874222c226368756e6b73223a327d",
+      "op": 3,
+      "opName": "write",
+      "reqId": 16909060,
+      "metaJson": "{\"path\":\"/tmp/a.txt\",\"chunks\":2}"
+    },
+    {
+      "name": "cmd_delete",
+      "kind": "cmd",
+      "frameType": 16,
+      "payloadHex": "00060000002a00157b2270617468223a222f746d702f622e747874227d",
+      "op": 6,
+      "opName": "delete",
+      "reqId": 42,
+      "metaJson": "{\"path\":\"/tmp/b.txt\"}"
+    },
+    {
+      "name": "upload_first",
+      "kind": "upload",
+      "frameType": 16,
+      "payloadHex": "010000000700000002deadbeef",
+      "reqId": 7,
+      "idx": 0,
+      "cnt": 2,
+      "rawHex": "deadbeef"
+    },
+    {
+      "name": "upload_second",
+      "kind": "upload",
+      "frameType": 16,
+      "payloadHex": "010000000700010002cafebabe",
+      "reqId": 7,
+      "idx": 1,
+      "cnt": 2,
+      "rawHex": "cafebabe"
+    },
+    {
+      "name": "resp_meta_ok",
+      "kind": "meta",
+      "frameType": 17,
+      "payloadHex": "0000000001000b7b226f6b223a747275657d",
+      "reqId": 1,
+      "metaJson": "{\"ok\":true}"
+    },
+    {
+      "name": "resp_meta_list",
+      "kind": "meta",
+      "frameType": 17,
+      "payloadHex": "000102030400257b226f70223a226c697374222c2270617468223a222f222c22656e7472696573223a5b5d7d",
+      "reqId": 16909060,
+      "metaJson": "{\"op\":\"list\",\"path\":\"/\",\"entries\":[]}"
+    },
+    {
+      "name": "resp_chunk_hello",
+      "kind": "chunk",
+      "frameType": 17,
+      "payloadHex": "01000000010001000368656c6c6f",
+      "reqId": 1,
+      "idx": 1,
+      "cnt": 3,
+      "rawHex": "68656c6c6f"
+    },
+    {
+      "name": "upload_empty_tail",
+      "kind": "upload",
+      "frameType": 16,
+      "payloadHex": "010000000900010002",
+      "reqId": 9,
+      "idx": 1,
+      "cnt": 2,
+      "rawHex": ""
+    }
+  ]
+}

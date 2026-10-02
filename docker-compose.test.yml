@@ -44,7 +44,7 @@ services:
 
   wragent:
     build:
-      context: ./wragent
+      context: ./wr
       dockerfile: Dockerfile
     container_name: test_wragent
     depends_on:
@@ -52,7 +52,7 @@ services:
         condition: service_healthy
     network_mode: host
     volumes:
-      - ./wragent/config.json:/config.json:ro
+      - ./wr/config.json:/config.json:ro
     command: ["-config", "/config.json"]
     restart: unless-stopped
 

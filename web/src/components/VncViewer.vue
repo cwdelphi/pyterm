@@ -2,6 +2,7 @@
 import { ref, onMounted, onBeforeUnmount } from 'vue'
 import { useI18n } from 'vue-i18n'
 import RFB from '@novnc/novnc'
+import { log, LogLevel, getLogLevel } from '../utils/logger'
 
 const { t } = useI18n()
 
@@ -153,16 +154,19 @@ function connect() {
     const transport = new DataChannelTransport(props.webrtcManager, props.conn)
     const origOnOpen = transport.onopen
     transport.onopen = () => {
-      console.log('[VNC] transport.onopen fired, readyState:', transport.readyState)
+      log(LogLevel.INFO, 'VNC', 'transport.onopen fired, readyState:', transport.readyState)
       if (origOnOpen) origOnOpen()
     }
     const origOnMessage = transport.onmessage
     transport.onmessage = (ev: any) => {
-      const data = ev.data
-      if (data instanceof ArrayBuffer) {
-        console.log('[VNC] transport.onmessage binary len:', data.byteLength)
-      } else if (data instanceof Array) {
-        console.log('[VNC] transport.onmessage array len:', data.length)
+      // 每个 VNC 帧都会进来：级别不够时不做任何判断与字符串构造
+      if (getLogLevel() <= LogLevel.DEBUG) {
+        const data = ev.data
+        if (data instanceof ArrayBuffer) {
+          log(LogLevel.DEBUG, 'VNC', 'onmessage binary len:', data.byteLength)
+        } else if (data instanceof Array) {
+          log(LogLevel.DEBUG, 'VNC', 'onmessage array len:', data.length)
+        }
       }
       if (origOnMessage) origOnMessage(ev)
     }

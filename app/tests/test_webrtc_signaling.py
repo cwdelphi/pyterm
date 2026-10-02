@@ -85,9 +85,9 @@ def _cleanup_state():
 
 def setup_module():
     _cleanup_user(_USER)
-    register_user(_USER, _PASS, f"wrtc_sig_{_TS}@test.com")
+    uid = (register_user(_USER, _PASS, f"wrtc_sig_{_TS}@test.com") or {}).get("id", "")
     for aid, tok in _AGENTS.items():
-        ensure_agent(aid, tok, name=f"Agent {aid}")
+        ensure_agent(aid, tok, name=f"Agent {aid}", owner_id=uid)
     for gid, tok in _GATEWAYS.items():
         ensure_gateway(gid, tok, name=f"GW {gid}")
     _cleanup_state()
@@ -118,8 +118,8 @@ class TestWebRTCHTTP:
         assert "ice_servers" in data
         servers = data["ice_servers"]
         assert isinstance(servers, list)
-        assert len(servers) >= 2
-        # 至少有一个 STUN 服务器
+        # L1: 不可达的 STUN 不下发, 条目数可能为 1, 但至少要有一项且必须含 STUN
+        assert len(servers) >= 1
         has_stun = any("stun" in s.get("urls", [""])[0].lower() for s in servers)
         assert has_stun
 

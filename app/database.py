@@ -11,6 +11,10 @@ import bcrypt
 from datetime import datetime, timezone
 from pathlib import Path
 
+
+def _env_public_ip() -> str:
+    return os.environ.get("SERVER_PUBLIC_IP", "203.0.113.12").strip()
+
 from sqlalchemy import text, func, select, Column, String, Integer, Boolean, Float, Text, ForeignKey, Index, UniqueConstraint
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -55,6 +59,7 @@ class Agent(Base):
     owner_id: Mapped[str] = mapped_column(String(64), default="")
     shared_with: Mapped[str] = mapped_column(String(512), default="private")
     conn_type: Mapped[str] = mapped_column(String(32), default="")
+    deploy_mode: Mapped[str] = mapped_column(String(32), default="")
     config_json: Mapped[str] = mapped_column(Text, default="{}")
     version: Mapped[str] = mapped_column(String(64), default="")
 
@@ -241,8 +246,20 @@ class ConnectionTimeline(Base):
     browser: Mapped[str] = mapped_column(String(32), default="")
     os_info: Mapped[str] = mapped_column(String(64), default="")
     connected_at: Mapped[str] = mapped_column(String(64), default="")
+    webrtc_path: Mapped[str] = mapped_column(String(16), default="")
     created_at: Mapped[str] = mapped_column(String(64), nullable=False)
     updated_at: Mapped[str] = mapped_column(String(64), nullable=False)
+
+
+class DeployLink(Base):
+    """模式二短链：/a/d/<code>、/a/s/<code>，只绑 Agent，模式由路径决定"""
+    __tablename__ = "deploy_links"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    code: Mapped[str] = mapped_column(String(16), nullable=False, unique=True)
+    agent_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    exp: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_by: Mapped[str] = mapped_column(String(64), default="")
+    created_at: Mapped[str] = mapped_column(String(64), default="")
 
 
 class TimelineStep(Base):
@@ -315,6 +332,11 @@ async def init_db():
             await conn.execute(text("ALTER TABLE agents ADD COLUMN conn_type VARCHAR(32) DEFAULT ''"))
         except Exception:
             pass
+        # 添加deploy_mode字段到agents表
+        try:
+            await conn.execute(text("ALTER TABLE agents ADD COLUMN deploy_mode VARCHAR(32) DEFAULT ''"))
+        except Exception:
+            pass
         # 添加owner_id和shared_with字段到coturn_servers表
         # 添加config_json字段到agents表
         try:
@@ -338,6 +360,14 @@ async def init_db():
             await conn.execute(text("ALTER TABLE coturn_servers ADD COLUMN shared_with VARCHAR(512) DEFAULT 'private'"))
         except Exception:
             pass
+        # 连接诊断: DC 链路标注 (P2P/relay/BUG)
+        for col, sql in [
+            ("webrtc_path", "ALTER TABLE connection_timeline ADD COLUMN webrtc_path VARCHAR(16) DEFAULT ''"),
+        ]:
+            try:
+                await conn.execute(text(sql))
+            except Exception:
+                pass
         # VNC fields for ssh_connections table
         for col, sql in [
             ("connection_type", "ALTER TABLE ssh_connections ADD COLUMN connection_type VARCHAR(10) DEFAULT 'ssh'"),
@@ -431,7 +461,7 @@ async def init_db():
                 db.add(Gateway(
                     id="local-gateway", name="本地网关",
                     token=_secrets.token_hex(32),
-                    url="wss://203.0.113.10:5599",
+                    url=f"wss://{_env_public_ip()}:5599",
                     remark="系统自动生成的本地网关", is_active=True,
                     created_at=datetime.now(timezone.utc).isoformat(),
                 ))
@@ -441,8 +471,9 @@ async def init_db():
         try:
             result = await db.execute(select(CoturnServer).where(CoturnServer.id == "coturn_default"))
             c = result.scalar_one_or_none()
-            if c and c.host in ("192.0.2.50", "192.0.2.50/192.0.2.50"):
-                c.host = "203.0.113.10"
+            _pub_ip = _env_public_ip()
+            if c and c.host in ("192.0.2.50", "192.0.2.50/192.0.2.50", "203.0.113.10", "203.0.113.10/203.0.113.10"):
+                c.host = _pub_ip
         except Exception:
             pass
         await db.commit()
@@ -496,7 +527,7 @@ async def _ensure_default_coturn(db: AsyncSession):
     db.add(CoturnServer(
         id="coturn_default",
         name="默认coturn",
-        host="203.0.113.10",
+        host=_env_public_ip(),
         port=19302,
         tls_port=5349,
         secret="change_me_turn",

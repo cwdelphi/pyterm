@@ -11,7 +11,7 @@ from app.api_timeline import timeline_router
 from app.api_isolated import router as api_router
 from app.api_isolated import agent_router
 from app.database import init_db, close_db
-from app.auth_api import auth_router, admin_router, webrtc_router, deploy_router
+from app.auth_api import auth_router, admin_router, webrtc_router, deploy_router, short_router
 from app.i18n import I18nMiddleware
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -59,6 +59,7 @@ app.include_router(admin_router)
 app.include_router(timeline_router)
 app.include_router(webrtc_router)
 app.include_router(deploy_router)
+app.include_router(short_router)  # /a/d/<code>、/a/s/<code>，须在静态 mount 之前注册
 
 
 def _build_tree(root: Path):

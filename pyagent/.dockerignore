@@ -1,0 +1,4 @@
+# 构建上下文只允许二进制进入镜像（config*.json / ssl/ / data/ 含 token 与私钥）
+*
+!wr
+!wr-arm64

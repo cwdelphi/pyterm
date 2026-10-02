@@ -14,10 +14,11 @@ ftproot/
 # 环境(含敏感配置)
 .env
 # 运行时 Agent/Gateway 配置(含 auth_token)
-wragent/config.json
-wragent/config/remote-agent-config.json
-wragent/data/
-wrgateway/config.json
+pyagent/config.json
+pyagent/config2.json
+pyagent/config-gateway.json
+pyagent/config/remote-agent-config.json
+pyagent/data/
 # 含 token 的一次性快照
 scripts/config-snapshot.json
 # 临时调试用例
@@ -43,15 +44,14 @@ static/
 *.bak3
 *.bak.*
 docs/mariadb_backup*.sql
+# 全库快照(体积大, 不入库)
+backups/
 
 # 编译产物
-wragent/wragent
-wragent/wragent_*
-wragent/wragent-*
-wrgateway/wrgateway
-wrgateway/wrgateway_*
-wrgateway/wrgateway-*
-wrgateway/ssl/
+pyagent/pyagent
+pyagent/pyagent_*
+pyagent/pyagent-*
+pyagent/ssl/
 *.exe
 *.old
 *.old-*
@@ -67,3 +67,4 @@ nginx/editor.html
 
 # 临时文件
 test-results/
+releases/

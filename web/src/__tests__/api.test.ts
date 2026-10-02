@@ -16,13 +16,6 @@ function mockJSON(data: any) {
   })
 }
 
-function mockText(text: string) {
-  mockFetch.mockResolvedValueOnce({
-    ok: true,
-    text: () => Promise.resolve(text),
-  })
-}
-
 describe('api.config', () => {
   it('fetches config', async () => {
     mockJSON({ site_name: 'test', home: 'home.md' })

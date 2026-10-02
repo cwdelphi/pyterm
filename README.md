@@ -103,7 +103,7 @@ docker compose up -d                           # 修改 .env 后重载 reload af
 | `TURN_SECRET` | — | coturn 长期凭证密钥。coturn long-term credential secret. |
 | `JWT_SECRET` / `JWT_EXPIRES_HOURS` | — / `24` | JWT 签名与有效期。JWT signing secret & expiry. |
 | `DB_HOST` / `DB_PORT` / `DB_USER` / `DB_PASS` / `DB_NAME` | `mariadb` / `3306` / `ppy` / — / `ppy_tools` | MariaDB 连接。MariaDB connection. |
-| `LATEST_AGENT_VERSION` | 同 `wragent/VERSION` | 门户公告的最新 Agent 版本。Latest agent version advertised by the portal. |
+| `LATEST_PYAGENT_VERSION` | 同 `pyagent/VERSION` | 门户公告的最新 pyagent 版本（单二进制，agent/gateway 共用）。Latest pyagent version advertised by the portal. |
 | `MD_ROOT` | `/app/md` | 默认 SFTP 共享目录（历史文档已迁移至 MinIO）。Default SFTP share dir (legacy docs migrated to MinIO). |
 
 端口调整只需修改 `.env` 中的 `HOST_PORT` 并 `docker compose up -d`。
@@ -138,12 +138,12 @@ DB_HOST=127.0.0.1 uvicorn app.main:app --reload
 - 集成测试（`test_integration_*`）依赖 `docker compose up -d test-ssh-server` 及相应环境变量（`SSH_HOST/SSH_PORT/SSH_USER/SSH_PASS`）；缺服务时会失败。
   Integration tests (`test_integration_*`) need `docker compose up -d test-ssh-server` and matching env vars; they fail without the service.
 
-## 远程接入 / Remote Access（wragent / wrgateway）
+## 远程接入 / Remote Access（pyagent 单二进制）
 
-- **wragent**：Go 编写的接入代理，部署在被管主机上，与门户建立 WebSocket/WebRTC 通道，提供 SSH/SFTP/VNC 隧道。版本见 `wragent/VERSION`。
-  Go agent deployed on managed hosts; opens WebSocket/WebRTC channels to the portal and tunnels SSH/SFTP/VNC. Version in `wragent/VERSION`.
-- **wrgateway**：WebRTC 信令网关，用于主机无公网地址时的连接中继。
-  WebRTC signaling gateway, relays connections for hosts without a public address.
+- **pyagent**：Go 编写的单二进制，`mode` 决定角色（`agent` 接入代理 / `gateway` 信令网关），同一份包跑两种角色。版本见 `pyagent/VERSION`（`1.0.x`，仅第三位递增）。
+  Single Go binary; `mode` selects the role (`agent` or `gateway`). Version in `pyagent/VERSION` (`1.0.x`, patch-only increments).
+  - 部署在被管主机上时与门户建立 WebSocket/WebRTC 通道，提供 SSH/SFTP/VNC 隧道。
+  - 无公网地址的主机经它中继 WebRTC 连接。
 - 两种安装模式 Two install modes：
   1. **模式一 · 公开安装**（Tailscale 式）：`curl -fsSL https://<host>:5588/install-agent | bash`，随后在管理后台「Agent 管理 → 待审批」中批准。
      **Mode 1 · public install**: run the curl above, then approve the pending agent in *Admin → Agents*.
@@ -152,12 +152,12 @@ DB_HOST=127.0.0.1 uvicorn app.main:app --reload
 - 发布构建 Release builds：
 
   ```bash
-  bash scripts/build-wragent.sh    # patch 版本 +1，写入 wragent/VERSION 与 .env
-  bash scripts/build-wrgateway.sh  # bumps patch, updates wragent/VERSION-style VERSION file + .env
+  PATH=$PATH:/usr/local/go/bin bash scripts/build-pyagent.sh          # 第三位 +1，写入 pyagent/VERSION 与 .env
+  PATH=$PATH:/usr/local/go/bin bash scripts/build-pyagent.sh --no-bump # 按当前 VERSION 重跑
   ```
 
-  系统 Go 版本过旧时用 `GO_BIN=/usr/local/go1.27/bin/go`。产物下载见管理后台「程序下载」或 `/api/deploy/wragent/{platform}`。
-  Use `GO_BIN=/usr/local/go1.27/bin/go` if the system Go is too old. Binaries: *Admin → Downloads* or `/api/deploy/wragent/{platform}`.
+  仅第三位（`1.0.x`）递增。产物下载见管理后台「程序下载」或 `/api/deploy/pyagent/{platform}`（兼容保留 `/api/deploy/wragent/{platform}`、`/api/deploy/wrgateway/{platform}`）。
+  Only the patch digit increments. Binaries: *Admin → Downloads* or `/api/deploy/pyagent/{platform}` (legacy `wragent`/`wrgateway` paths still work).
 
 ## API 概览 / API Overview
 

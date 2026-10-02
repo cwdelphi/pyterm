@@ -22,9 +22,10 @@ def _cleanup_user(username: str):
 
 def setup_module():
     _cleanup_user(_WRTC_USER)
-    register_user(_WRTC_USER, _WRTC_PASS, "wrtc@test.com")
+    uid = (register_user(_WRTC_USER, _WRTC_PASS, "wrtc@test.com") or {}).get("id", "")
     # S5: register 必须已有 DB 记录且 token 匹配
-    ensure_agent(_TEST_AGENT_ID, _TEST_AGENT_TOKEN, name="API Test Agent")
+    # S6: webterm-open 审计需可见性, 测试 Agent 归属到测试用户
+    ensure_agent(_TEST_AGENT_ID, _TEST_AGENT_TOKEN, name="API Test Agent", owner_id=uid)
 
 
 def teardown_module():

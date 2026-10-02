@@ -56,7 +56,7 @@ function connParams() {
 }
 
 function formatSize(bytes: number): string {
-  if (bytes === 0) return '-'
+  if (bytes === 0) return '0 B'
   const units = ['B', 'KB', 'MB', 'GB', 'TB']
   const i = Math.floor(Math.log(bytes) / Math.log(1024))
   return (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + ' ' + units[i]
@@ -152,7 +152,8 @@ async function openTextPreview(f: RemoteFile) {
     } else {
       result = await api.sftpClientRead({ ...connParams(), path })
     }
-    previewContent.value = decodeBase64Utf8(result.content)
+    // T1.3: webrtc 路径 read 返回 raw bytes
+    previewContent.value = props.webrtcManager ? new TextDecoder().decode(result.content) : decodeBase64Utf8(result.content)
     previewPath.value = f.name
     previewIsMd.value = false
     renderedMd.value = ''
@@ -170,7 +171,8 @@ async function openMdPreview(f: RemoteFile) {
     } else {
       result = await api.sftpClientRead({ ...connParams(), path })
     }
-    previewContent.value = decodeBase64Utf8(result.content)
+    // T1.3: webrtc 路径 read 返回 raw bytes
+    previewContent.value = props.webrtcManager ? new TextDecoder().decode(result.content) : decodeBase64Utf8(result.content)
     previewPath.value = f.name
     previewIsMd.value = true
     showPreview.value = true
@@ -223,7 +225,8 @@ async function downloadFile(f: RemoteFile) {
     if (props.webrtcManager) {
       try {
         const result = await props.webrtcManager.sendSftpRequest('read', { path })
-        saveBlob(new Blob([Uint8Array.from(atob(result.content), (c) => c.charCodeAt(0))]), f.name)
+        // T1.3: webrtc 路径 read 返回 raw bytes, Blob 直接消费
+        saveBlob(new Blob([result.content]), f.name)
         return
       } catch (e2: any) {
         toast?.error?.(e2.message || t('sftpBrowser.downloadFailed'))
@@ -241,16 +244,6 @@ function saveBlob(blob: Blob, name: string) {
   a.download = name
   a.click()
   URL.revokeObjectURL(url)
-}
-
-function arrayBufferToBase64(buf: ArrayBuffer): string {
-  const bytes = new Uint8Array(buf)
-  let bin = ''
-  const CHUNK = 0x8000
-  for (let i = 0; i < bytes.length; i += CHUNK) {
-    bin += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + CHUNK)) as unknown as number[])
-  }
-  return btoa(bin)
 }
 
 function openNewDialog(type: 'file' | 'dir') { newType.value = type; newName.value = ''; showNewDialog.value = true }
@@ -331,7 +324,8 @@ function handleUpload() {
             const buf = await file.arrayBuffer()
             await props.webrtcManager.sendSftpRequest('write', {
               path: currentPath.value.replace(/\/$/, '') + '/' + file.name,
-              content: arrayBufferToBase64(buf),
+              // T1.3: 二进制协议下 content 传 raw bytes, 免 base64
+              content: new Uint8Array(buf),
             })
             continue
           } catch (e2: any) {

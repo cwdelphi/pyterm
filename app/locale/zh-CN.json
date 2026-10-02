@@ -76,7 +76,9 @@
   "ws.token_expired_gateway": "Token已过期",
   "ws.auth_failed": "认证失败",
   "ws.agent_offline": "Agent不在线",
+  "ws.agent_no_permission": "无权访问该Agent",
   "ws.gateway_offline": "网关不在线",
+  "ws.gateway_no_permission": "无权访问该网关",
   "ws.target_agent_offline": "目标Agent不在线",
   "ws.speedtest_same_agent": "源与目标Agent不能相同",
   "ws.speedtest_invalid_limit": "无效的限速档",
@@ -129,5 +131,8 @@
   "timeline.connect_target": "连接目标服务器",
   "timeline.p2p_ice_dc": "WebRTC通道建立 (网关↔Agent)",
   "timeline.browser": "浏览器",
-  "timeline.target_server": "目标服务器"
+  "timeline.target_server": "目标服务器",
+  "admin.ice_scan_offline": "Agent不在线，无法扫描",
+  "admin.ice_scan_timeout": "ICE扫描超时(5s)，请检查Agent连接",
+  "admin.ice_scan_superseded": "ICE扫描被新的请求取代"
 }

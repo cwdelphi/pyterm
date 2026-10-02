@@ -3,15 +3,18 @@
 为每个用户提供独立的数据存储空间
 """
 import asyncio
+import atexit
 import collections
 import errno
 import json
 import logging
 import os
 import posixpath
+import queue
 import uuid
 import stat as _sftp_stat
 from datetime import datetime, timezone
+from logging.handlers import QueueHandler, QueueListener
 from pathlib import Path
 from typing import Optional
 
@@ -27,7 +30,7 @@ from sqlalchemy import select, update, delete, text, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .database import get_db, Document, LinkGroup, LinkItem, SshConnection, SftpConfig, Agent, User, CoturnServer, Gateway
-from .auth import get_current_user, get_user_data_dir, get_ice_servers
+from .auth import get_current_user, get_user_data_dir, get_ice_servers, require_permission
 from .crypto import encrypt_secret, decrypt_secret
 from .minio_client import ensure_bucket, upload_doc, download_doc, delete_doc
 from .models import (
@@ -47,15 +50,30 @@ LOGS_DIR = Path(os.environ.get("LOGS_DIR", str(Path(__file__).resolve().parent.p
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Logging ──────────────────────────────────────────────
+#
+# 事件循环里绝不能做同步磁盘 I/O：FileHandler 是同步的，每条日志都会卡住
+# 一次事件循环（信令路径上 ICE candidate/answer 高频打点时尤其明显）。
+# 这里改用 QueueHandler + QueueListener，把格式化与写盘挪到后台线程。
+
+_log_level = os.environ.get("APP_LOG_LEVEL", "INFO").upper()
 
 _logger = logging.getLogger("app")
-_logger.setLevel(logging.DEBUG)
+_logger.setLevel(getattr(logging, _log_level, logging.INFO))
+
+_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
 _fh = logging.FileHandler(LOGS_DIR / "backend.log", encoding="utf-8")
-_fh.setLevel(logging.DEBUG)
-_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+_fh.setLevel(getattr(logging, _log_level, logging.INFO))
 _fh.setFormatter(_fmt)
-_logger.addHandler(_fh)
+
+_log_q: "queue.Queue[logging.LogRecord]" = queue.Queue(-1)
+_qh = QueueHandler(_log_q)
+_qh.setFormatter(_fmt)
+_logger.addHandler(_qh)
+
+_log_listener = QueueListener(_log_q, _fh, respect_handler_level=True)
+_log_listener.start()
+atexit.register(_log_listener.stop)
 
 _ch = logging.StreamHandler()
 _ch.setLevel(logging.INFO)
@@ -161,16 +179,20 @@ async def _write_user_sftp_config_db(db: AsyncSession, user_id: str, data: dict)
     await db.commit()
 
 
-async def _upsert_agent_to_db(agent_id: str, agent_name: str, version: str = ""):
+async def _upsert_agent_to_db(agent_id: str, agent_name: str, version: str = "", deploy_mode: str = ""):
     """wragent 注册时自动在数据库中创建/更新 agent 记录"""
     import secrets
     async with get_db_session() as db:
         result = await db.execute(select(Agent).where(Agent.id == agent_id))
         agent = result.scalar_one_or_none()
         if agent:
-            agent.name = agent_name
+            # 保留管理台命名的显示名: 仅当行名为原始 agent_id(未改名) 或为空时才跟随上报名
+            if (agent.name or "") == agent.id or not agent.name:
+                agent.name = agent_name
             if version:
                 agent.version = version
+            if deploy_mode:
+                agent.deploy_mode = deploy_mode
         else:
             db.add(Agent(
                 id=agent_id, name=agent_name,
@@ -178,6 +200,7 @@ async def _upsert_agent_to_db(agent_id: str, agent_name: str, version: str = "")
                 remark="自动注册", is_active=True,
                 created_at=datetime.now(timezone.utc).isoformat(),
                 version=version,
+                deploy_mode=deploy_mode,
             ))
         await db.commit()
 
@@ -1282,16 +1305,22 @@ class LogReq(BaseModel):
     level: str = "info"
     msg: str = ""
     module: str = ""
+    # 兼容前端上报字段 (api.frontendLog 发的是 message/url)
+    message: str = ""
+    url: str = ""
 
 
 @router.post("/log")
 def log_receive(req: LogReq):
-    _logger.info("Frontend [%s] %s: %s", req.module, req.level, req.msg)
+    # S4: 保持开放(登录前异常也要能上报), 但对写入做长度截断, 防刷与防超长行
+    _msg = (req.msg or req.message or "")[:2000]
+    _mod = (req.module or req.url or "")[:200]
+    _logger.info("Frontend [%s] %s: %s", _mod, (req.level or "info")[:16], _msg)
     return {"ok": True}
 
 
 @router.get("/logs")
-def log_list():
+def log_list(user: dict = Depends(require_permission("system:admin"))):
     backend_log = LOGS_DIR / "backend.log"
     frontend_log = LOGS_DIR / "frontend.log"
     lines = []
@@ -1338,6 +1367,105 @@ def _agent_config_with_mirror(config: dict) -> dict:
     out = dict(config)
     out["tunnels"] = merged
     return out
+
+
+# ── P1: 后台 ICE 扫描通道（方案 §4.2 ice_scan_req / network_info）──
+# 后台 → md(HTTP) → Agent(WS ice_scan_req) → md(WS network_info) → 回写 config_json.net_info
+_ice_scan_waiters: dict[str, "asyncio.Future[dict]"] = {}  # agent_id -> pending report
+ICE_SCAN_TIMEOUT = 5.0  # 方案 §4.2: 超时 409
+
+
+async def _persist_net_info(agent_id: str, net_info: dict) -> None:
+    """把 Agent 上报的 network_info 合并进 agents.config_json.net_info（只增不覆盖其它键）"""
+    try:
+        async with get_db_session() as db:
+            res = await db.execute(select(Agent).where(Agent.id == agent_id))
+            row = res.scalar_one_or_none()
+            if not row:
+                return
+            cfg = {}
+            if row.config_json:
+                try:
+                    cfg = json.loads(row.config_json)
+                except Exception:
+                    cfg = {}
+            if not isinstance(cfg, dict):
+                cfg = {}
+            cfg["net_info"] = net_info
+            await db.execute(
+                update(Agent).where(Agent.id == agent_id)
+                .values(config_json=json.dumps(cfg, ensure_ascii=False))
+            )
+            await db.commit()
+    except Exception as e:
+        _logger.warning("persist net_info failed agent=%s: %s", agent_id, e)
+
+
+async def _agent_ice_policy(agent_id: str) -> dict:
+    """P2 §4.5: 取 agent config_json.ice 的阶梯策略子集, 随 connect_success 下发给网关。
+    缺省 true/true(与 IceOptReq 字段一致), 读不到也返回缺省值, 网关侧再有 env 兜底。"""
+    _policy = {"auto_fallback": True, "path_cache": True}
+    if not agent_id:
+        return _policy
+    try:
+        async with get_db_session() as db:
+            res = await db.execute(select(Agent.config_json).where(Agent.id == agent_id))
+            raw = res.scalar_one_or_none()
+    except Exception as e:
+        _logger.warning("read ice policy failed agent=%s: %s", agent_id, e)
+        return _policy
+    try:
+        cfg = json.loads(raw) if raw else {}
+        ice = cfg.get("ice") if isinstance(cfg, dict) else None
+        if isinstance(ice, dict):
+            _policy["auto_fallback"] = bool(ice.get("auto_fallback", True))
+            _policy["path_cache"] = bool(ice.get("path_cache", True))
+    except Exception:
+        pass
+    return _policy
+
+
+async def request_ice_scan(agent_id: str, timeout: float = ICE_SCAN_TIMEOUT) -> dict:
+    """下发 ice_scan_req 并等待 network_info 回包。
+    Agent 离线 / 5s 超时 → 409（后台"立即扫描"按钮的失败路径）。"""
+    if agent_id not in _online_agents:
+        raise HTTPException(status_code=409, detail=t("admin.ice_scan_offline"))
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future = loop.create_future()
+    old = _ice_scan_waiters.pop(agent_id, None)
+    if old is not None and not old.done():
+        old.cancel()
+    _ice_scan_waiters[agent_id] = fut
+    try:
+        await _online_agents[agent_id]["ws"].send_text(
+            json.dumps({"type": "ice_scan_req", "data": {}}))
+        return await asyncio.wait_for(fut, timeout)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=409, detail=t("admin.ice_scan_timeout"))
+    except asyncio.CancelledError:
+        raise HTTPException(status_code=409, detail=t("admin.ice_scan_superseded"))
+    finally:
+        if _ice_scan_waiters.get(agent_id) is fut:
+            del _ice_scan_waiters[agent_id]
+
+
+async def _handle_network_info(agent_id: str, payload) -> None:
+    """Agent→Server: network_info。先落库，再唤醒挂起的扫描请求。"""
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            payload = None
+    if not isinstance(payload, dict) or not payload:
+        _logger.warning("[AS-WS] network_info invalid from agent=%s", agent_id)
+        return
+    await _persist_net_info(agent_id, payload)
+    _logger.info("[AS-WS] network_info agent=%s if_hash=%s interfaces=%d",
+                 agent_id, payload.get("if_hash", ""),
+                 len(payload.get("interfaces") or []))
+    fut = _ice_scan_waiters.pop(agent_id, None)
+    if fut is not None and not fut.done():
+        fut.set_result(payload)
 
 
 async def _push_config_to_agent(agent_id: str, config: dict) -> bool:
@@ -1400,6 +1528,58 @@ async def _user_sees_agent(user_id: str, agent_id: str) -> bool:
     except Exception as e:
         _logger.warning("[SPEEDTEST] visibility check failed: %s", e)
         return False
+
+
+async def _user_sees_gateway(user_id: str, gateway_id: str) -> bool:
+    """与 adminListGateways 相同的可见性过滤(owner/共享)"""
+    try:
+        async with get_db_session() as db:
+            r = await db.execute(
+                select(Gateway.id).where(
+                    Gateway.id == gateway_id,
+                    (Gateway.owner_id == user_id)
+                    | (Gateway.shared_with == "all")
+                    | Gateway.shared_with.contains(f'"{user_id}"'),
+                )
+            )
+            return r.scalar_one_or_none() is not None
+    except Exception as e:
+        _logger.warning("[ISOLATE] gateway visibility check failed: %s", e)
+        return False
+
+
+async def _visible_agent_ids(user_id: str) -> set:
+    """当前用户可见的 Agent id 集合(一条 SQL, 供列表接口过滤)"""
+    try:
+        async with get_db_session() as db:
+            r = await db.execute(
+                select(Agent.id).where(
+                    (Agent.owner_id == user_id)
+                    | (Agent.shared_with == "all")
+                    | Agent.shared_with.contains(f'"{user_id}"')
+                )
+            )
+            return {row[0] for row in r.all()}
+    except Exception as e:
+        _logger.warning("[ISOLATE] visible agents query failed: %s", e)
+        return set()
+
+
+async def _visible_gateway_ids(user_id: str) -> set:
+    """当前用户可见的 Gateway id 集合(一条 SQL, 供列表接口过滤)"""
+    try:
+        async with get_db_session() as db:
+            r = await db.execute(
+                select(Gateway.id).where(
+                    (Gateway.owner_id == user_id)
+                    | (Gateway.shared_with == "all")
+                    | Gateway.shared_with.contains(f'"{user_id}"')
+                )
+            )
+            return {row[0] for row in r.all()}
+    except Exception as e:
+        _logger.warning("[ISOLATE] visible gateways query failed: %s", e)
+        return set()
 
 
 async def _has_active_turn() -> bool:
@@ -1532,6 +1712,8 @@ async def ws_webrtc(ws: WebSocket):
                         _db_ct = _r.scalar_one_or_none() or ""
                 except Exception:
                     pass
+                _agent_deploy = _data_field.get("deploy_mode", "") if isinstance(_data_field, dict) else ""
+                _agent_arch = _data_field.get("arch", "") if isinstance(_data_field, dict) else ""
                 _online_agents[agent_id] = {
                     "ws": ws,
                     "name": agent_name,
@@ -1540,9 +1722,11 @@ async def ws_webrtc(ws: WebSocket):
                     "status": "online",
                     "ip": client_ip,
                     "conn_type": _db_ct,
+                    "deploy_mode": _agent_deploy,
+                    "arch": _agent_arch or "amd64",
                 }
                 _agent_version = msg.get("agent_version", _data_field.get("agent_version", "1.0.0")) if isinstance(_data_field, dict) else msg.get("agent_version", "1.0.0")
-                await _upsert_agent_to_db(agent_id, agent_name, _agent_version)
+                await _upsert_agent_to_db(agent_id, agent_name, _agent_version, _agent_deploy)
                 _logger.info("[AS-WS] agent registered %s (%s) v%s from %s", agent_id, agent_name, _agent_version, client_ip)
 
                 # 获取默认 coturn 服务器的 ICE 配置下发给 agent
@@ -1683,6 +1867,11 @@ async def ws_webrtc(ws: WebSocket):
                     await ws.send_text(json.dumps({"type": "error", "detail": t("ws.agent_offline")}))
                     continue
 
+                # S1(隔离): 可见性与 /api/admin/agents 同规则, 不可见不得建房开 shell
+                if not (await _user_sees_agent(user_id, target_agent_id)):
+                    await ws.send_text(json.dumps({"type": "error", "detail": t("ws.agent_no_permission")}))
+                    continue
+
                 # R3: room 属主 — 同一 browser 可重连覆盖，他人不得劫持
                 _dup_same_ws = False
                 if room_id in _agent_connections:
@@ -1759,6 +1948,15 @@ async def ws_webrtc(ws: WebSocket):
                     await ws.send_text(json.dumps({"type": "error", "detail": t("ws.gateway_offline")}))
                     continue
 
+                # S1(隔离): 网关与目标 Agent 可见性, 同 /api/admin/gateways、/api/admin/agents 规则
+                if not (await _user_sees_gateway(user_id, target_gateway_id)):
+                    await ws.send_text(json.dumps({"type": "error", "detail": t("ws.gateway_no_permission")}))
+                    continue
+                if target_agent_id and target_agent_id != target_gateway_id \
+                        and not (await _user_sees_agent(user_id, target_agent_id)):
+                    await ws.send_text(json.dumps({"type": "error", "detail": t("ws.agent_no_permission")}))
+                    continue
+
                 # R3: room 属主
                 if room_id in _agent_connections:
                     existing = _agent_connections[room_id]
@@ -1798,6 +1996,7 @@ async def ws_webrtc(ws: WebSocket):
                         "user_id": user_id,
                     }))
 
+                # P2: 网关阶梯所需的策略(config_json.ice.auto_fallback/path_cache), 网关按 agent 记忆
                 await ws.send_text(json.dumps({
                     "type": "connect_success",
                     "room_id": room_id,
@@ -1805,6 +2004,7 @@ async def ws_webrtc(ws: WebSocket):
                     "client_ip": client_ip,
                     "agent_ip": _online_agents.get(target_agent_id, {}).get("ip", "") if target_agent_id else "",
                     "gateway_ip": _online_gateways.get(target_gateway_id, {}).get("ip", "") if target_gateway_id else "",
+                    "ice_policy": await _agent_ice_policy(target_agent_id or target_gateway_id),
                 }))
                 _logger.info("[BS-WS] browser connected to gateway %s agent %s, room %s (agent_online=%s)",
                     target_gateway_id, target_agent_id, room_id, bool(agent_ws))
@@ -1935,6 +2135,7 @@ async def ws_webrtc(ws: WebSocket):
                     _speedtest_active["last_activity"] = time.time()
                 target_ws = conn.get("progress_ws")
                 if msg_type == "speedtest_result":
+                    _ping = conn.get("ping") or {}
                     _speedtest_history.append({
                         "source": conn.get("speedtest_src", ""),
                         "target": conn.get("agent_id", ""),
@@ -1942,6 +2143,9 @@ async def ws_webrtc(ws: WebSocket):
                         "up_mbps": payload.get("up_mbps", 0),
                         "down_mbps": payload.get("down_mbps", 0),
                         "duration": payload.get("duration", 0),
+                        "ping_ms": _ping.get("ping_ms", 0),
+                        "jitter_ms": _ping.get("jitter_ms", 0),
+                        "loss_pct": _ping.get("loss_pct", 0),
                         "finished_at": time.time(),
                     })
                 if target_ws is not None:
@@ -1955,6 +2159,30 @@ async def ws_webrtc(ws: WebSocket):
                     await _speedtest_end(room_id,
                                          reason=payload.get("detail", "") if msg_type == "speedtest_error" else "",
                                          notify_agents=False)
+
+            elif msg_type == "speedtest_ping":
+                # 源端上报 PING 结果: 缓存供 result 合并进历史, 并转发浏览器
+                _proom = msg.get("room_id", "") or _speedtest_data(msg).get("room_id", "")
+                _pconn = _agent_connections.get(_proom)
+                if _pconn:
+                    _pp = _speedtest_data(msg)
+                    _pconn["ping"] = {
+                        "ping_ms": _pp.get("ping_ms", 0),
+                        "jitter_ms": _pp.get("jitter_ms", 0),
+                        "loss_pct": _pp.get("loss_pct", 0),
+                    }
+                    _ptarget = _pconn.get("progress_ws")
+                    if _ptarget is not None:
+                        try:
+                            await _ptarget.send_text(json.dumps({
+                                "type": "speedtest_ping",
+                                "ping_ms": _pp.get("ping_ms", 0),
+                                "jitter_ms": _pp.get("jitter_ms", 0),
+                                "loss_pct": _pp.get("loss_pct", 0),
+                            }))
+                        except Exception:
+                            pass
+                continue
 
             elif msg_type == "speedtest_cancel":
                 # 浏览器中止: 双端 stop + 清房间(TC-ST02)
@@ -1988,13 +2216,18 @@ async def ws_webrtc(ws: WebSocket):
                         "sdp": offer_sdp,
                         "from": "gateway" if is_gw else "browser",
                     }
+                    # P2 §4.5: 网关宣告的 ICE 等级(L1只放行缓存接口/L2规则/L3不过滤), md 重造 dict 必须显式透传
+                    _ice_lvl = msg.get("ice_level")
+                    if isinstance(_ice_lvl, int) and _ice_lvl > 0:
+                        forward["ice_level"] = _ice_lvl
                     await conn["agent_ws"].send_text(json.dumps(forward))
 
             elif msg_type == "answer":
                 # 转发 Answer — R3: agent 的 answer → gateway(若有)否则 browser
                 room_id = msg.get("room_id", "")
                 conn = _agent_connections.get(room_id)
-                _logger.info("[GA-DC] answer routed: room=%s has_conn=%s has_browser=%s", room_id, bool(conn), bool(conn and conn.get("browser_ws")))
+                # 每次 answer 都打一条会把信令路径塞满磁盘写；降到 DEBUG（默认级别下零开销）
+                _logger.debug("[GA-DC] answer routed: room=%s has_conn=%s has_browser=%s", room_id, bool(conn), bool(conn and conn.get("browser_ws")))
                 if not conn:
                     continue
                 is_agent = conn.get("agent_ws") is ws
@@ -2027,7 +2260,8 @@ async def ws_webrtc(ws: WebSocket):
                 room_id = msg.get("room_id", "")
                 from_role = msg.get("from", "")
                 conn = _agent_connections.get(room_id)
-                _logger.info("[GA-DC] candidate routed: room=%s from=%s has_conn=%s has_agent=%s has_browser=%s", room_id, from_role, bool(conn), bool(conn and conn.get("agent_ws")), bool(conn and conn.get("browser_ws")))
+                # ICE candidate 每连接 5–30 条，逐条写盘属事件循环内同步 I/O；降到 DEBUG
+                _logger.debug("[GA-DC] candidate routed: room=%s from=%s has_conn=%s has_agent=%s has_browser=%s", room_id, from_role, bool(conn), bool(conn and conn.get("agent_ws")), bool(conn and conn.get("browser_ws")))
                 if not conn:
                     continue
                 is_browser = conn.get("browser_ws") is ws
@@ -2131,7 +2365,11 @@ async def ws_webrtc(ws: WebSocket):
                     if not _rescued:
                         _logger.warning("[AS-WS] heartbeat without agent/gateway role role=%r agent_id=%r type=%s",
                                         role, agent_id, msg_type)
-                await ws.send_text(json.dumps({"type": "heartbeat_ack"}))
+                # L2(延迟): 回显客户端 ts, 浏览器用 now-ts 得到信令 RTT(不受时钟偏差影响)
+                _ack = {"type": "heartbeat_ack"}
+                if isinstance(msg.get("ts"), (int, float)):
+                    _ack["ts"] = msg["ts"]
+                await ws.send_text(json.dumps(_ack))
 
             elif msg_type == "agent_diagnostics":
                 # Agent WS回退路径: 诊断数据通过信令转发到浏览器
@@ -2160,6 +2398,13 @@ async def ws_webrtc(ws: WebSocket):
                 if role == "agent" and agent_id:
                     ok = msg.get("data", {}).get("ok", False)
                     _logger.info(f"[WS] config_update_ack agent={agent_id} ok={ok}")
+
+            elif msg_type == "network_info":
+                # Agent→Server: 网络接口清单(注册后/周期扫描/ice_scan_req 回包)
+                if role == "agent" and agent_id:
+                    await _handle_network_info(agent_id, msg.get("data"))
+                else:
+                    _logger.warning("[AS-WS] network_info from non-agent role=%r", role)
 
             elif msg_type == "connection_type":
                 # 浏览器上报 WebRTC 连接类型 (P2P/relay/BUG)
@@ -2220,6 +2465,10 @@ async def ws_webrtc(ws: WebSocket):
         if role == "agent" and agent_id in _online_agents and _online_agents[agent_id].get("ws") is ws:
             del _online_agents[agent_id]
             _logger.info("[AS-WS] agent %s removed from online list", agent_id)
+            # 未回包的 ice_scan_req 随连接作废（挂起方收到 CancelledError → 409）
+            _pending = _ice_scan_waiters.pop(agent_id, None)
+            if _pending is not None and not _pending.done():
+                _pending.cancel()
         elif role == "gateway" and agent_id and agent_id in _online_gateways and _online_gateways[agent_id].get("ws") is ws:
             del _online_gateways[agent_id]
             _logger.info("[GS-WS] gateway %s removed from online list", agent_id)
@@ -2241,10 +2490,13 @@ async def ws_webrtc(ws: WebSocket):
 
 
 @router.get("/webrtc/agents")
-def list_agents(user: dict = Depends(get_current_user)):
-    """获取在线 wragent 列表"""
+async def list_agents(user: dict = Depends(get_current_user)):
+    """获取在线 wragent 列表 — S2(隔离): 仅返回当前用户可见的 Agent"""
+    visible = await _visible_agent_ids(user.get("id", ""))
     agents_list = []
     for aid, info in _online_agents.items():
+        if aid not in visible:
+            continue
         agents_list.append({
             "id": aid,
             "name": info["name"],
@@ -2258,10 +2510,13 @@ def list_agents(user: dict = Depends(get_current_user)):
 
 
 @router.get("/webrtc/gateways")
-def list_gateways(user: dict = Depends(get_current_user)):
-    """获取在线 wrgateway 列表"""
+async def list_gateways(user: dict = Depends(get_current_user)):
+    """获取在线 wrgateway 列表 — S2(隔离): 仅返回当前用户可见的网关"""
+    visible = await _visible_gateway_ids(user.get("id", ""))
     gateways_list = []
     for gid, info in _online_gateways.items():
+        if gid not in visible:
+            continue
         gateways_list.append({
             "id": gid,
             "name": info["name"],
@@ -2283,9 +2538,12 @@ def speedtest_history(user: dict = Depends(get_current_user)):
 
 @router.get("/webrtc/rooms")
 def list_rooms(user: dict = Depends(get_current_user)):
-    """获取活跃的 WebRTC 房间"""
+    """获取活跃的 WebRTC 房间 — S3(隔离): 仅本人的房间(含 tunnel 房间不外泄)"""
+    uid = user.get("id", "")
     rooms = []
     for room_id, conn in _agent_connections.items():
+        if conn.get("user_id") != uid:
+            continue
         rooms.append({
             "room_id": room_id,
             "agent_id": conn["agent_id"],
@@ -2505,21 +2763,27 @@ async def agent_setup_confirm(req: AgentSetupReq, user: dict = Depends(get_curre
     return {"ok": True, "agent_id": agent_id}
 
 
+# L5(延迟): 假活判定阈值与巡检周期 — 心跳 15~30s, 阈值取 2 个心跳周期(60s)，
+# 误判可由同连接 heartbeat rehydrate 自愈；巡检 60s→15s 使最坏可见延迟 150s→75s
+_AGENT_STALE_SECONDS = 60
+_STALE_SWEEP_SECONDS = 15
+
+
 async def _cleanup_setup_sessions():
     """定时清理过期的 setup 会话（30 分钟）；R9: last_seen 看门狗踢掉假活 agent/gateway"""
     while True:
-        await asyncio.sleep(60)
+        await asyncio.sleep(_STALE_SWEEP_SECONDS)
         now = time.time()
         expired = [sid for sid, s in _setup_sessions.items() if now - s["created_at"] > 1800]
         for sid in expired:
             _setup_sessions.pop(sid, None)
             _logger.info("webrtc: setup session expired sid=%s", sid)
-        # R9: 超过 90s 无心跳视为离线（正常心跳 15~30s）
+        # R9: 超过阈值无心跳视为离线
         for _id, info in list(_online_agents.items()):
-            if now - info.get("last_seen", now) > 90:
+            if now - info.get("last_seen", now) > _AGENT_STALE_SECONDS:
                 _logger.warning("[AS-WS] agent %s stale (last_seen %.0fs), removing", _id, now - info.get("last_seen", now))
                 _online_agents.pop(_id, None)
         for _id, info in list(_online_gateways.items()):
-            if now - info.get("last_seen", now) > 90:
+            if now - info.get("last_seen", now) > _AGENT_STALE_SECONDS:
                 _logger.warning("[GS-WS] gateway %s stale (last_seen %.0fs), removing", _id, now - info.get("last_seen", now))
                 _online_gateways.pop(_id, None)

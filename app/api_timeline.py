@@ -51,6 +51,8 @@ class TimelineReport(BaseModel):
     agent_ssh_port: int = 0
     # 前端置位：agent 成功诊断已到达（亚毫秒截断/证据兜底）
     agent_ok: int = 0
+    # DC 链路标注：P2P / relay / BUG（空=未检测）
+    webrtc_path: str = ""
     # Browser timing (raw)
     t_start: float = 0
     t_ws_open: float = 0
@@ -75,6 +77,8 @@ class TimelineQuery(BaseModel):
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     agent_id: Optional[str] = None
+    # DC 链路筛选：P2P / relay / BUG / none(未检测)
+    webrtc_path: Optional[str] = None
 
 
 class TimelineDetailQuery(BaseModel):
@@ -687,8 +691,17 @@ _TIMELINE_STR_LIMITS = {
     "host": 255, "username": 255, "path_mode": 32, "client_ip": 64,
     "agent_1_ip": 128, "agent_1_name": 255, "agent_2_ip": 128, "agent_2_name": 255,
     "gateway_ip": 128, "agent_id": 64, "error_stage": 32,
-    "browser": 32, "os_info": 64, "connected_at": 64,
+    "browser": 32, "os_info": 64, "connected_at": 64, "webrtc_path": 16,
 }
+
+
+def _webrtc_path_condition(webrtc_path: Optional[str]):
+    """DC 链路筛选条件；'none' 表示未检测（空串）。"""
+    if not webrtc_path:
+        return None
+    if webrtc_path == "none":
+        return ConnectionTimeline.webrtc_path == ""
+    return ConnectionTimeline.webrtc_path == webrtc_path
 
 
 def _trunc(val, limit: int) -> str:
@@ -807,7 +820,7 @@ async def _upsert_timeline(req: TimelineReport, db: AsyncSession, user: dict, no
         # Non-empty-only fields
         for field in ["duration_total", "client_ip", "agent_1_ip", "agent_1_name",
                        "agent_2_ip", "agent_2_name", "gateway_ip", "browser", "os_info",
-                       "agent_ssh_host", "agent_ssh_port"]:
+                       "agent_ssh_host", "agent_ssh_port", "webrtc_path"]:
             val = getattr(req, field, None)
             if val and val != "" and val != 0:
                 updates[field] = val
@@ -850,6 +863,7 @@ async def _upsert_timeline(req: TimelineReport, db: AsyncSession, user: dict, no
             browser=req.browser,
             os_info=req.os_info,
             connected_at=req.connected_at,
+            webrtc_path=_trunc(req.webrtc_path, 16),
             created_at=now,
             updated_at=now,
         )
@@ -887,6 +901,38 @@ async def _upsert_timeline(req: TimelineReport, db: AsyncSession, user: dict, no
     return {"ok": True, "room_id": req.room_id, "steps": len(steps)}
 
 
+class WebRtcPathReq(BaseModel):
+    room_id: str
+    webrtc_path: str = ""
+
+
+@timeline_router.post("/webrtc-path")
+async def update_webrtc_path(req: WebRtcPathReq, db: AsyncSession = Depends(get_db), user=Depends(get_current_user)):
+    """补报 DC 链路标注（P2P/relay/BUG）：只更新 webrtc_path 一列。
+    时序说明：detectConnType 需 RTC connected 后 1.5s~4.5s，常晚于首包触发的
+    reportDiagnostic（一次性），因此检测结果晚到时走本端点补报，
+    不复用 /report 以免重算 steps/success 写坏原记录。"""
+    if not req.room_id:
+        raise HTTPException(status_code=400, detail="room_id required")
+    path = _trunc(req.webrtc_path, 16)
+    if path not in ("P2P", "relay", "BUG"):
+        raise HTTPException(status_code=400, detail="invalid webrtc_path")
+    result = await db.execute(
+        select(ConnectionTimeline).where(
+            ConnectionTimeline.room_id == req.room_id,
+            ConnectionTimeline.user_id == user["id"],
+        )
+    )
+    record = result.scalar_one_or_none()
+    if not record:
+        raise HTTPException(status_code=404, detail="not found")
+    if path:  # 空值不覆盖已有标注
+        record.webrtc_path = path
+        record.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        await db.commit()
+    return {"ok": True, "room_id": req.room_id, "webrtc_path": record.webrtc_path}
+
+
 @timeline_router.post("/records")
 async def list_records(req: TimelineQuery, db: AsyncSession = Depends(get_db), user=Depends(get_current_user)):
     conditions = [ConnectionTimeline.user_id == user["id"]]
@@ -902,6 +948,9 @@ async def list_records(req: TimelineQuery, db: AsyncSession = Depends(get_db), u
         conditions.append(ConnectionTimeline.created_at <= req.end_date + " 23:59:59")
     if req.search:
         conditions.append(ConnectionTimeline.conn_name.contains(req.search) | ConnectionTimeline.host.contains(req.search))
+    _wp = _webrtc_path_condition(req.webrtc_path)
+    if _wp is not None:
+        conditions.append(_wp)
 
     where = and_(*conditions) if conditions else True
     total_q = await db.execute(select(func.count(ConnectionTimeline.id)).where(where))
@@ -920,7 +969,8 @@ async def list_records(req: TimelineQuery, db: AsyncSession = Depends(get_db), u
             "success": r.success, "error_stage": r.error_stage,
             "completed_steps": r.completed_steps, "total_steps": r.total_steps,
             "agent_id": r.agent_id, "created_at": r.created_at,
-            "browser": r.browser or "", "gateway_ip": r.gateway_ip or "", 
+            "browser": r.browser or "", "gateway_ip": r.gateway_ip or "",
+            "webrtc_path": r.webrtc_path or "",
         })
 
     return {"items": items, "total": total, "page": req.page, "page_size": req.page_size}
@@ -990,6 +1040,7 @@ async def get_detail(req: TimelineDetailQuery, db: AsyncSession = Depends(get_db
             "conn_name": record.conn_name, "conn_type": record.conn_type,
             "host": record.host, "port": record.port,
             "path_mode": record.path_mode,
+            "webrtc_path": record.webrtc_path or "",
             "client_ip": record.client_ip,
             "agent_ip": agent_ip, "agent_name": agent_name,
             "gateway_ip": record.gateway_ip,
@@ -1005,6 +1056,16 @@ async def get_detail(req: TimelineDetailQuery, db: AsyncSession = Depends(get_db
     }
 
 
+def _percentile(sorted_vals: list, q: float) -> float:
+    """线性插值分位数(输入需已排序, 空集合返回 0)"""
+    if not sorted_vals:
+        return 0.0
+    k = (len(sorted_vals) - 1) * q
+    f = int(k)
+    c = min(f + 1, len(sorted_vals) - 1)
+    return round(sorted_vals[f] + (sorted_vals[c] - sorted_vals[f]) * (k - f), 1)
+
+
 @timeline_router.post("/stats")
 async def get_stats(req: TimelineQuery, db: AsyncSession = Depends(get_db), user=Depends(get_current_user)):
     conditions = [ConnectionTimeline.user_id == user["id"]]
@@ -1014,6 +1075,9 @@ async def get_stats(req: TimelineQuery, db: AsyncSession = Depends(get_db), user
         conditions.append(ConnectionTimeline.created_at >= req.start_date)
     if req.end_date:
         conditions.append(ConnectionTimeline.created_at <= req.end_date + " 23:59:59")
+    _wp = _webrtc_path_condition(req.webrtc_path)
+    if _wp is not None:
+        conditions.append(_wp)
 
     where = and_(*conditions) if conditions else True
 
@@ -1026,10 +1090,72 @@ async def get_stats(req: TimelineQuery, db: AsyncSession = Depends(get_db), user
     avg_q = await db.execute(select(func.avg(ConnectionTimeline.duration_total)).where(and_(where, ConnectionTimeline.success == 1)))
     avg_total = round(avg_q.scalar() or 0, 1)
 
+    # DC 链路统计：P2P 占比 = P2P / (P2P + relay)，仅统计已知直连/中继的记录
+    p2p_q = await db.execute(select(func.count(ConnectionTimeline.id)).where(and_(where, ConnectionTimeline.webrtc_path == "P2P")))
+    p2p_count = p2p_q.scalar() or 0
+    relay_q = await db.execute(select(func.count(ConnectionTimeline.id)).where(and_(where, ConnectionTimeline.webrtc_path == "relay")))
+    relay_count = relay_q.scalar() or 0
+
+    # L3(延迟): 长尾分位数 — avg 会掩盖 p95，取最近 5000 条成功记录在 Python 侧算
+    dur_rows = (await db.execute(
+        select(ConnectionTimeline.duration_total)
+        .where(and_(where, ConnectionTimeline.success == 1))
+        .order_by(desc(ConnectionTimeline.id)).limit(5000)
+    )).all()
+    durs = sorted(float(r[0] or 0) for r in dur_rows)
+
+    # L3(延迟): 分阶段聚合 — timeline_steps.latency_ms 按 (from,to,protocol) 分组
+    step_rows = (await db.execute(
+        select(TimelineStep.from_node, TimelineStep.to_node, TimelineStep.protocol,
+               TimelineStep.action, TimelineStep.latency_ms)
+        .join(ConnectionTimeline, ConnectionTimeline.room_id == TimelineStep.room_id)
+        .where(and_(where, ConnectionTimeline.success == 1))
+        .order_by(desc(ConnectionTimeline.id)).limit(20000)
+    )).all()
+    buckets: dict = {}
+    proto_vals: dict = {}  # P1(任务1.12): 按 protocol 聚合，供 ICE/DC 看板取数
+    for _fn, _tn, _pf, _act, _lat in step_rows:
+        key = f"{_fn}|{_tn}|{_pf}"
+        b = buckets.setdefault(key, {"from_node": _fn, "to_node": _tn, "protocol": _pf,
+                                     "action": _act or "", "values": []})
+        if not b["action"] and _act:
+            b["action"] = _act
+        b["values"].append(float(_lat or 0))
+        proto_vals.setdefault(_pf or "", []).append(float(_lat or 0))
+    stages = []
+    for key in sorted(buckets):
+        b = buckets[key]
+        vals = sorted(b["values"])
+        stages.append({
+            "from_node": b["from_node"], "to_node": b["to_node"],
+            "protocol": b["protocol"], "action": b["action"],
+            "count": len(vals),
+            "avg": round(sum(vals) / len(vals), 1),
+            "p50": _percentile(vals, 0.50),
+            "p95": _percentile(vals, 0.95),
+        })
+
+    def _proto_stats(proto: str) -> dict:
+        vals = sorted(proto_vals.get(proto, []))
+        if not vals:
+            return {"count": 0, "avg": 0.0, "p50": 0.0, "p95": 0.0}
+        return {"count": len(vals), "avg": round(sum(vals) / len(vals), 1),
+                "p50": _percentile(vals, 0.50), "p95": _percentile(vals, 0.95)}
+
     return {
         "total": total,
         "success_count": success_count,
         "fail_count": total - success_count,
         "success_rate": round(success_count / max(total, 1) * 100, 1),
         "avg_total": avg_total,
+        "p50_total": _percentile(durs, 0.50),
+        "p95_total": _percentile(durs, 0.95),
+        "stages": stages,
+        # P1(任务1.12): ICE 效果看板 —— duration_ice/dc 的分阶段聚合
+        "ice_stage": _proto_stats("WebRTC ICE"),
+        "dc_stage": _proto_stats("WebRTC DC"),
+        "webrtc_stage": _proto_stats("WebRTC"),
+        "p2p_count": p2p_count,
+        "relay_count": relay_count,
+        "p2p_rate": round(p2p_count * 100 / max(p2p_count + relay_count, 1), 1),
     }

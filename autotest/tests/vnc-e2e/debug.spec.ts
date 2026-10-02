@@ -33,7 +33,7 @@ test('VNC debug', async ({ page }) => {
     username: '',
     password: '',
     connection_type: 'vnc',
-    vnc_port: 6000,
+    vnc_port: 5900, // 对齐测试环境实际监听(pyterm_test_ssh 内 Xtigervnc)
     vnc_password: 'vncPass123',
   })
 

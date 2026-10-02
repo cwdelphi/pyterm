@@ -10,7 +10,7 @@
   - `github` = github 上的 public 脱敏版仓库（URL 见 `git remote -v`；orphan 独立历史 `public` 分支）
 - 同步公开版的唯一入口：`bash scripts/publish-github.sh`
   （导出 master 已跟踪文件 → 按 `scripts/publish-dict.tsv` 字面脱敏 → 敏感词扫描，**命中即中止不推送** → 提交并推 `public:main`）。
-- 敏感运行时文件已被 `.gitignore` 排除（`.env`、`wragent/config.json`、`wrgateway/config.json`、`scripts/config-snapshot.json`、`docs/mariadb_backup*.sql`、`*.pem`、数据目录等），**不要取消忽略**。
+- 敏感运行时文件已被 `.gitignore` 排除（`.env`、`pyagent/config*.json`、`scripts/config-snapshot.json`、`docs/mariadb_backup*.sql`、`*.pem`、数据目录等），**不要取消忽略**。
 - 新增敏感词（口令/域名/IP）时必须同步追加到 `scripts/publish-dict.tsv`，否则会被扫描 gate 拦下。
 - 发布设施本身（`publish-github.sh`、`publish-dict.tsv`）含敏感词，脚本会自动从公开版剔除，不要移除该逻辑。
 - commit message 用中文。
@@ -47,7 +47,7 @@
 
 ### 代码风格
 - 使用 `<script setup>` + TypeScript；组件名 PascalCase；样式为 scoped CSS。
-- 文案改动必须中英同步：前端 `web/src/i18n/{zh-CN,en}.json`（键集须完全一致，636 键）、后端 `app/locale/{zh-CN,en}.json`。
+- 文案改动必须中英同步：前端 `web/src/i18n/{zh-CN,en}.json`（键集须完全一致，当前 782 键，增删键后同步本行数字）、后端 `app/locale/{zh-CN,en}.json`。
 
 ## 常用命令
 
@@ -60,7 +60,7 @@
 | `./run-baseline-tests.sh` | 基线三段：pytest + vitest + E2E |
 | `docker restart pyterm_md` | 后端/静态改动生效 |
 | `bash scripts/publish-github.sh` | 脱敏同步公开版到 github |
-| `scripts/build-wragent.sh` / `build-wrgateway.sh` | Go 二进制构建（自动 bump patch，`GO_BIN=/usr/local/go1.27/bin/go`） |
+| `bash scripts/build-pyagent.sh` | pyagent 单二进制出包（自动 bump 第三位 `1.0.x`；`PATH=$PATH:/usr/local/go/bin`，GOTOOLCHAIN=auto 拉 go1.27） |
 
 - 集成测试（`test_integration_*`）依赖 `docker compose up -d test-ssh-server` 及 `SSH_HOST/SSH_PORT/SSH_USER/SSH_PASS`，缺服务会失败。
 
@@ -68,5 +68,5 @@
 
 - 方案/设计文档统一保存到 `docs/` 目录。
 - 同一内容多份时用**版本号**区分文件名：`<主题>_v<主版本>.<次版本>.md`（如 `xx_v1.0.md`、`xx_v1.1.md`），禁止覆盖旧版。
-- 部署/运维总览见 [`docs/部署方案_v1.0.md`](./docs/部署方案_v1.0.md)：服务器清单、**部署前 `uname -m` 确认 CPU 架构选二进制**、Agent 标准部署与待注册审批、凭据与发布脱敏。
+- 部署/运维总览见 [`docs/部署方案_v1.1.md`](./docs/部署方案_v1.1.md)：服务器清单、**部署前 `uname -m` 确认 CPU 架构选二进制**、Agent 三件套宿主控制台部署与待注册审批、出包/nygpu 兼容坑、凭据与发布脱敏（v1.0 仍留存）。
 - 端口缺省 `5588`（见 `.env` 的 `PORT`/`HOST_PORT`，模板见 `.env.example`），调整改 `.env` 即可。

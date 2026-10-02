@@ -189,8 +189,11 @@ def _write_user_ssh(user_id: str, data: list[dict]):
     engine.dispose()
 
 
-def ensure_agent(agent_id: str, token: str, name: str = "Test Agent"):
-    """预置 Agent 记录(含 token), 供 webrtc 注册鉴权测试使用"""
+def ensure_agent(agent_id: str, token: str, name: str = "Test Agent", owner_id: str = ""):
+    """预置 Agent 记录(含 token), 供 webrtc 注册鉴权测试使用
+
+    owner_id: 属主(S1 隔离校验依赖可见性, 测试需显式归属到测试用户)
+    """
     from datetime import datetime, timezone
     from app.database import Agent
     engine, Session = _make_sync_factories()
@@ -200,9 +203,12 @@ def ensure_agent(agent_id: str, token: str, name: str = "Test Agent"):
             existing.token = token
             existing.name = name
             existing.is_active = True
+            if owner_id:
+                existing.owner_id = owner_id
         else:
             s.add(Agent(
                 id=agent_id, name=name, token=token, is_active=True,
+                owner_id=owner_id,
                 created_at=datetime.now(timezone.utc).isoformat(),
             ))
         s.commit()
@@ -210,8 +216,11 @@ def ensure_agent(agent_id: str, token: str, name: str = "Test Agent"):
     return {"id": agent_id, "token": token}
 
 
-def ensure_gateway(gateway_id: str, token: str, name: str = "Test Gateway", url: str = "ws://localhost:5599"):
-    """预置 Gateway 记录(含 token), 供 webrtc 注册鉴权测试使用"""
+def ensure_gateway(gateway_id: str, token: str, name: str = "Test Gateway", url: str = "ws://localhost:5599", owner_id: str = ""):
+    """预置 Gateway 记录(含 token), 供 webrtc 注册鉴权测试使用
+
+    owner_id: 属主(S1 隔离校验依赖可见性, 测试需显式归属到测试用户)
+    """
     from datetime import datetime, timezone
     from app.database import Gateway
     engine, Session = _make_sync_factories()
@@ -221,9 +230,12 @@ def ensure_gateway(gateway_id: str, token: str, name: str = "Test Gateway", url:
             existing.token = token
             existing.name = name
             existing.is_active = True
+            if owner_id:
+                existing.owner_id = owner_id
         else:
             s.add(Gateway(
                 id=gateway_id, name=name, token=token, url=url, is_active=True,
+                owner_id=owner_id,
                 created_at=datetime.now(timezone.utc).isoformat(),
             ))
         s.commit()

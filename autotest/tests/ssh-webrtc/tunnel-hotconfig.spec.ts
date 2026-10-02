@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test'
-import { goSshView, assertTerminalVisible, termTypeAndCheck, apiLogin } from '../helpers'
+import { goSshView, assertTerminalVisible, termTypeAndCheck, apiLogin, expandAgentGroup } from '../helpers'
 
 // TC-PL03/04: 热改隧道配置 —— 仅 tunnel 插件动, webterm 会话不断, SOCKS5 不受影响
 const AGENT_ID = process.env.WEBTERM_AGENT || 'local-agent'
@@ -22,6 +22,7 @@ function listenCheck(port: number): string {
 test.describe('TC-PL03/04 隧道热配置接线', () => {
   test('热改隧道端口: webterm不断/新端口生效/旧端口关闭/SOCKS5不受影响', async ({ page }) => {
     await goSshView(page)
+    await expandAgentGroup(page)
     const card = agentCard(page)
     await expect(card).toBeVisible({ timeout: 10000 })
     await card.click()

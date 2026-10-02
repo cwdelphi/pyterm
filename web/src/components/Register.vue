@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, defineEmits } from 'vue'
 import { useI18n } from 'vue-i18n'
+import { reloadLogLevel } from '../utils/logger'
 
 const { t } = useI18n()
 const emit = defineEmits<{
@@ -70,6 +71,7 @@ async function handleRegister() {
     // 存储token
     localStorage.setItem('token', loginData.token)
     localStorage.setItem('user', JSON.stringify(loginData.user))
+    reloadLogLevel()  // 日志等级按账户隔离
 
     emit('register', loginData.token, loginData.user)
   } catch (e: any) {

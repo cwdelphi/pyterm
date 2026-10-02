@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onBeforeUnmount, inject } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, inject } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { api } from '../api'
 import { fetchOnlineGateways } from '../utils/webrtc'
@@ -16,6 +16,24 @@ interface Gateway {
 }
 
 const gateways = ref<Gateway[]>([])
+
+/* ── 分页(与 AdminPanel usePagination 同款, 常驻分页栏) ── */
+const pageSize = 10
+const page = ref(1)
+const totalPages = computed(() => Math.max(1, Math.ceil(gateways.value.length / pageSize)))
+const total = computed(() => gateways.value.length)
+const pageNumbers = computed(() => {
+  const pages: number[] = []
+  const start = Math.max(1, page.value - 2)
+  const end = Math.min(totalPages.value, page.value + 2)
+  for (let i = start; i <= end; i++) pages.push(i)
+  return pages
+})
+const paginated = computed(() => {
+  const start = (page.value - 1) * pageSize
+  return gateways.value.slice(start, start + pageSize)
+})
+function goPage(p: number) { if (p >= 1 && p <= totalPages.value) page.value = p }
 const onlineIds = ref<Set<string>>(new Set())
 const showAddForm = ref(false)
 const showEditForm = ref(false)
@@ -162,7 +180,7 @@ onBeforeUnmount(() => {
           <th>ID</th><th>{{ t('common.name') }}</th><th>{{ t('common.ip') }}</th><th>{{ t('admin.versionTag') }}</th><th>{{ t('common.token') }}</th><th>{{ t('common.status') }}</th><th>{{ t('common.share') }}</th><th>{{ t('common.action') }}</th>
         </tr></thead>
         <tbody>
-          <tr v-for="gw in gateways" :key="gw.id">
+          <tr v-for="gw in paginated" :key="gw.id">
             <td class="mono">{{ gw.id }}</td>
             <td>{{ gw.name }}<span v-if="gw.owner_name" class="owner-badge">{{ gw.owner_name }}</span></td>
             <td class="mono" :title="gw.url">{{ gw.url || '-' }}</td>
@@ -172,27 +190,35 @@ onBeforeUnmount(() => {
               <span v-if="gw.needs_upgrade" class="upgrade-tip" :title="'Latest v' + (gw.latest_version || '')">⚠️ {{ t('common.upgrade') }}</span>
             </td>
             <td class="token-cell">
-              <button class="token-btn" :title="t('common.copy')" @click="copyGatewayToken(gw.token)">📋</button>
+              <button v-if="gw.token" class="token-btn" :title="t('common.copy')" @click="copyGatewayToken(gw.token)">📋</button>
+              <span v-else :title="t('admin.sharedReadonly')">-</span>
             </td>
             <td>
               <span class="status-dot" :class="gw.is_active ? (onlineIds.has(gw.id) ? 'online' : 'offline') : 'disabled'"></span>
               {{ !gw.is_active ? t('common.disabled') : (onlineIds.has(gw.id) ? t('common.online') : t('common.offline')) }}
             </td>
-            <td><button class="share-tag" :class="gw.shared_with === 'all' ? 'share-all' : gw.shared_with === 'private' ? 'share-private' : 'share-select'" @click="emit('share', gw)">
+            <td><button v-if="gw.is_owner" class="share-tag" :class="gw.shared_with === 'all' ? 'share-all' : gw.shared_with === 'private' ? 'share-private' : 'share-select'" @click="emit('share', gw)">
               {{ gw.shared_with === 'all' ? t('admin.shareAll') : gw.shared_with === 'private' ? t('admin.sharePrivate') : t('admin.shareSelect') }}
-            </button></td>
+            </button><span v-else class="share-tag" :title="t('admin.sharedReadonly')">{{ t('admin.sharedFromTag') }}</span></td>
             <td class="actions-cell">
               <div class="actions-inner">
-                <button v-if="gw.needs_upgrade" class="text-btn success" @click="upgradeGateway(gw)" style="color:#16a34a">{{ t('admin.upgradeVersion') }}{{ gw.latest_version }}</button>
-                <button class="text-btn sm" @click="openEdit(gw)">{{ t('common.edit') }}</button>
-                <button class="text-btn sm danger" @click="openDelete(gw)">{{ t('common.delete') }}</button>
-                <button class="text-btn sm" :class="gw.is_active ? 'warn' : 'success'" @click="toggleStatus(gw)">{{ gw.is_active ? t('common.disabled') : t('common.enabled') }}</button>
+                <button v-if="gw.needs_upgrade" class="text-btn success" :disabled="!gw.is_owner" :title="gw.is_owner ? '' : t('admin.sharedReadonly')" @click="upgradeGateway(gw)" style="color:#16a34a">{{ t('admin.upgradeVersion') }}{{ gw.latest_version }}</button>
+                <button class="text-btn sm" :disabled="!gw.is_owner" :title="gw.is_owner ? '' : t('admin.sharedReadonly')" @click="openEdit(gw)">{{ t('common.edit') }}</button>
+                <button class="text-btn sm danger" :disabled="!gw.is_owner" :title="gw.is_owner ? '' : t('admin.sharedReadonly')" @click="openDelete(gw)">{{ t('common.delete') }}</button>
+                <button class="text-btn sm" :class="gw.is_active ? 'warn' : 'success'" :disabled="!gw.is_owner" :title="gw.is_owner ? '' : t('admin.sharedReadonly')" @click="toggleStatus(gw)">{{ gw.is_active ? t('common.disabled') : t('common.enabled') }}</button>
               </div>
             </td>
           </tr>
-          <tr v-if="!gateways.length"><td colspan="8" class="empty-row">{{ t('admin.gateways') }}</td></tr>
+          <tr v-if="!paginated.length"><td colspan="8" class="empty-row">{{ t('admin.gateways') }}</td></tr>
         </tbody>
-      </table></div>
+</table>
+          <div class="table-pagination">
+          <button class="page-btn" :disabled="page <= 1" @click="goPage(page - 1)">‹ {{ t('common.prev') }}</button>
+          <button v-for="p in pageNumbers" :key="p" class="page-btn page-num" :class="{ active: p === page }" @click="goPage(p)">{{ p }}</button>
+          <button class="page-btn" :disabled="page >= totalPages" @click="goPage(page + 1)">{{ t('common.next') }} ›</button>
+          <span class="page-info">{{ t('common.pageTotal', { n: total, p: totalPages }) }}</span>
+        </div>
+        </div>
     </div>
 
     <!-- 添加网关弹窗 -->

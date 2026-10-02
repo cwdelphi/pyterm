@@ -1,6 +1,8 @@
 """认证API路由 - MariaDB + SQLAlchemy async"""
+from typing import Literal
 from pydantic import BaseModel, Field
 import os
+import glob
 import secrets
 import time
 import jwt
@@ -19,7 +21,7 @@ from .models import (
     CoturnServerAdd, CoturnServerUpdate, AuditLogResponse,
     BatchDeleteRequest,
 )
-from .database import User, Agent, AuditLog, CoturnServer, Gateway
+from .database import User, Agent, AuditLog, CoturnServer, Gateway, DeployLink
 from .auth import (
     register_user, login_user, get_current_user, require_admin,
     require_permission, _get_user_by_id, _verify_password, get_ice_servers,
@@ -31,6 +33,7 @@ auth_router = APIRouter(prefix="/api/auth", tags=["认证"])
 admin_router = APIRouter(prefix="/api/admin", tags=["管理"])
 webrtc_router = APIRouter(prefix="/api/webrtc", tags=["WebRTC"])
 deploy_router = APIRouter(prefix="/api/deploy", tags=["部署"])
+short_router = APIRouter(tags=["部署短链"])  # 无前缀：/a/d/<code>、/a/s/<code>（必须先于静态挂载注册）
 
 
 # ════════════════════════════════════════════════════════════
@@ -225,6 +228,17 @@ async def admin_my_permissions(user: dict = Depends(get_current_user)):
     return {"role": user["role"], "permissions": perms, "all_permissions": PERMISSIONS}
 
 
+@admin_router.get("/shareable-users")
+async def admin_shareable_users(user: dict = Depends(require_permission("agent:manage")),
+                                db: AsyncSession = Depends(get_db)):
+    """指定共享用的用户候选名单：仅 id + username（不含邮箱/角色等敏感字段），排除自己与已禁用账户"""
+    result = await db.execute(
+        select(User.id, User.username).where(User.id != user["id"], User.is_active == True)
+        .order_by(User.username)
+    )
+    return {"users": [{"id": row[0], "username": row[1]} for row in result.all()]}
+
+
 # ════════════════════════════════════════════════════════════
 #  审计日志 API
 # ════════════════════════════════════════════════════════════
@@ -267,6 +281,16 @@ async def webterm_open(req: WebtermOpenReq, request: Request,
                        user: dict = Depends(require_permission("ssh:manage")),
                        db: AsyncSession = Depends(get_db)):
     """webterm 控制台打开审计(N6: 可见即有 shell 权限, 打开动作留痕)"""
+    # S6(隔离): 审计目标必须是本人可见的 Agent, 防止伪造他人操作留痕
+    if req.agent_id:
+        r = await db.execute(select(Agent.id).where(
+            Agent.id == req.agent_id,
+            (Agent.owner_id == user["id"])
+            | (Agent.shared_with == "all")
+            | Agent.shared_with.contains(f'"{user["id"]}"'),
+        ))
+        if r.scalar_one_or_none() is None:
+            raise HTTPException(status_code=403, detail=t("ws.agent_no_permission"))
     ip = request.client.host if request.client else ""
     await log_audit(db, user["id"], user["username"], "agent.webterm_open",
                     "agent", req.agent_id, req.agent_name, ip)
@@ -278,7 +302,7 @@ async def webterm_open(req: WebtermOpenReq, request: Request,
 # ════════════════════════════════════════════════════════════
 
 @admin_router.get("/agent-id/next")
-async def admin_next_agent_id(user: dict = Depends(require_admin), db: AsyncSession = Depends(get_db)):
+async def admin_next_agent_id(user: dict = Depends(require_permission("agent:manage")), db: AsyncSession = Depends(get_db)):
     today = datetime.now(timezone.utc).strftime("%Y%m%d")
     prefix = f"wragent-{today}"
     result = await db.execute(
@@ -323,12 +347,14 @@ async def admin_list_agents(user: dict = Depends(require_permission("agent:manag
         _ver = a.version if _online_ver in ("", "unknown") else _online_ver
         _needs_upgrade, _latest_version = _check_version_upgrade("agent", _ver)
         agent_list.append({
-            "id": a.id, "name": a.name, "token": a.token,
+            "id": a.id, "name": a.name, "token": a.token if is_owner else "",
             "coturn_id": a.coturn_id or "",
             "remark": a.remark, "is_active": a.is_active,
             "ip": online_info.get("ip", ""),
             "online": bool(online_info),
             "conn_type": online_info.get("conn_type") or a.conn_type or "",
+            "deploy_mode": online_info.get("deploy_mode") or a.deploy_mode or "",
+            "arch": online_info.get("arch", ""),
             "owner_id": a.owner_id, "owner_name": owner_name if not is_owner else "",
             "is_owner": is_owner, "shared_with": a.shared_with,
             "version": _ver,
@@ -339,11 +365,18 @@ async def admin_list_agents(user: dict = Depends(require_permission("agent:manag
 
 
 @admin_router.post("/agents/{agent_id}/upgrade")
-async def upgrade_agent(agent_id: str, user: dict = Depends(require_permission("agent:manage"))):
-    """发送upgrade指令到在线agent"""
+async def upgrade_agent(agent_id: str, user: dict = Depends(require_permission("agent:manage")), db: AsyncSession = Depends(get_db)):
+    """发送upgrade指令到在线agent（仅属主）"""
     import os
+    from fastapi import HTTPException
     from .api_isolated import _online_agents, push_upgrade_to_agent
-    latest = os.environ.get("LATEST_AGENT_VERSION", "")
+    ar = await db.execute(select(Agent).where(Agent.id == agent_id))
+    ag = ar.scalar_one_or_none()
+    if not ag:
+        raise HTTPException(status_code=404, detail="agent not found")
+    if ag.owner_id != user["id"]:
+        raise HTTPException(status_code=403, detail=t("admin.no_operate_others_agent"))
+    latest = (os.environ.get("LATEST_PYAGENT_VERSION") or os.environ.get("LATEST_WR_VERSION") or os.environ.get("LATEST_AGENT_VERSION", ""))
     if not latest:
         from fastapi import HTTPException
         raise HTTPException(status_code=400, detail=t("admin.no_version_configured"))
@@ -351,7 +384,8 @@ async def upgrade_agent(agent_id: str, user: dict = Depends(require_permission("
         from fastapi import HTTPException
         raise HTTPException(status_code=400, detail=t("admin.agent_offline"))
     base_url = os.environ.get("PUBLIC_URL", "https://domain:5588")
-    download_url = f"{base_url}/api/deploy/wragent/linux-amd64"
+    _arch = _online_agents.get(agent_id, {}).get("arch") or "amd64"
+    download_url = f"{base_url}/api/deploy/wragent/linux-{_arch}"
     ok = await push_upgrade_to_agent(agent_id, latest, download_url)
     if not ok:
         from fastapi import HTTPException
@@ -360,11 +394,18 @@ async def upgrade_agent(agent_id: str, user: dict = Depends(require_permission("
 
 
 @admin_router.post("/gateways/{gateway_id}/upgrade")
-async def upgrade_gateway(gateway_id: str, user: dict = Depends(require_permission("agent:manage"))):
-    """发送upgrade指令到在线gateway"""
+async def upgrade_gateway(gateway_id: str, user: dict = Depends(require_permission("agent:manage")), db: AsyncSession = Depends(get_db)):
+    """发送upgrade指令到在线gateway（仅属主）"""
     import os
+    from fastapi import HTTPException
     from .api_isolated import _online_gateways, push_upgrade_to_gateway
-    latest = os.environ.get("LATEST_GATEWAY_VERSION", "")
+    gr = await db.execute(select(Gateway).where(Gateway.id == gateway_id))
+    gw = gr.scalar_one_or_none()
+    if not gw:
+        raise HTTPException(status_code=404, detail="gateway not found")
+    if gw.owner_id != user["id"]:
+        raise HTTPException(status_code=403, detail=t("admin.no_operate_others_gateway"))
+    latest = (os.environ.get("LATEST_PYAGENT_VERSION") or os.environ.get("LATEST_WR_VERSION") or os.environ.get("LATEST_GATEWAY_VERSION", ""))
     if not latest:
         from fastapi import HTTPException
         raise HTTPException(status_code=400, detail=t("admin.no_version_configured"))
@@ -372,7 +413,8 @@ async def upgrade_gateway(gateway_id: str, user: dict = Depends(require_permissi
         from fastapi import HTTPException
         raise HTTPException(status_code=400, detail=t("admin.gateway_offline"))
     base_url = os.environ.get("PUBLIC_URL", "https://domain:5588")
-    download_url = f"{base_url}/api/deploy/wrgateway/linux-amd64"
+    _gw_arch = _online_gateways.get(gateway_id, {}).get("arch") or "amd64"
+    download_url = f"{base_url}/api/deploy/wrgateway/linux-{_gw_arch}"
     ok = await push_upgrade_to_gateway(gateway_id, latest, download_url)
     if not ok:
         from fastapi import HTTPException
@@ -488,6 +530,8 @@ async def admin_get_agent_shares(agent_id: str, user: dict = Depends(require_per
     agent = result.scalar_one_or_none()
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
+    if agent.owner_id != user["id"]:
+        raise HTTPException(status_code=403, detail=t("admin.no_operate_others_agent"))
     import json
     shared_with = agent.shared_with
     usernames = []
@@ -506,6 +550,19 @@ async def admin_get_agent_shares(agent_id: str, user: dict = Depends(require_per
 
 import json as _json
 
+class IceOptReq(BaseModel):
+    """ICE 优化规则 —— 对应 config_json.ice（方案 §4.1）"""
+    enabled: bool = Field(True, description="ICE接口过滤总开关(false=1键熔断)")
+    mode: Literal["auto", "custom", "blacklist", "off"] = Field(
+        "auto", description="auto=本地自扫描评分 | custom=白名单keep | blacklist=仅黑名单 | off=不过滤")
+    keep: list[str] = Field(default_factory=list, description="白名单接口(mode=auto/custom)")
+    drop_prefix: list[str] = Field(default_factory=list, description="附加丢弃前缀(硬黑名单恒定合并,不可删除)")
+    allow_tailscale: bool = Field(False, description="是否允许 tailscale0(决策D2 缺省 false)")
+    auto_fallback: bool = Field(True, description="[P2] ICE失败回退阶梯")
+    path_cache: bool = Field(True, description="[P2] 路径缓存")
+    conn_reuse: bool = Field(False, description="[P3] L0连接复用")
+
+
 class AgentConfigReq(BaseModel):
     ws_reconnect_interval: int = Field(5, ge=1, le=60, description="WebSocket重连间隔(秒)")
     ws_heartbeat_interval: int = Field(30, ge=5, le=120, description="心跳间隔(秒)")
@@ -513,6 +570,8 @@ class AgentConfigReq(BaseModel):
     log_level: str = Field("info", description="日志级别(debug/info/warn/error)")
     tunnels: list = Field(default=[], description="[兼容]旧版隧道列表(plugins为空时按protocol拆分)")
     plugins: dict = Field(default_factory=dict, description="插件配置字典 {tunnel,socks5}")
+    ice: IceOptReq | None = Field(None, description="[P1] ICE优化规则(config_json.ice); 不传=保留原值")
+    ice_cache_clear: bool = Field(False, description="[P2] 清空路径缓存(仅随本次推送, 不落库)")
 
 
 _PLUGIN_KEYS = {"tunnel", "socks5"}
@@ -608,6 +667,13 @@ async def admin_update_agent_config(agent_id: str, req: AgentConfigReq, request:
     # 存量 plugins.ssh 键接受并剥离(内嵌SSH服务已移除), 不报错并随落库回写清除
     plugins = _strip_ssh_plugin({"plugins": plugins})["plugins"]
     _validate_plugins(plugins)
+    # 方案 §4.1: PUT 按请求体重建整个 dict, 必须先读回 prev 保留 Agent 上报的只读键
+    prev: dict = {}
+    if agent.config_json:
+        try:
+            prev = _json.loads(agent.config_json)
+        except Exception:
+            prev = {}
     config = {
         "ws_reconnect_interval": req.ws_reconnect_interval,
         "ws_heartbeat_interval": req.ws_heartbeat_interval,
@@ -615,14 +681,39 @@ async def admin_update_agent_config(agent_id: str, req: AgentConfigReq, request:
         "log_level": req.log_level,
         "plugins": plugins,
     }
+    if isinstance(prev.get("net_info"), dict):
+        config["net_info"] = prev["net_info"]
+    if req.ice is not None:
+        config["ice"] = req.ice.model_dump()
+    elif isinstance(prev.get("ice"), dict):
+        config["ice"] = prev["ice"]
     agent.config_json = _json.dumps(config, ensure_ascii=False)
     await db.commit()
     # 推送配置到 Agent(_push_config_to_agent 自动附加 tunnels 镜像, 旧Agent兼容)
     from .api_isolated import _online_agents, _push_config_to_agent
-    pushed = await _push_config_to_agent(agent_id, config)
+    push_cfg = config
+    if req.ice_cache_clear:
+        # P2: 清空路径缓存只随本次推送下发, 不落库(否则后续每次推送都会重复清空)
+        push_cfg = dict(config, ice_cache_clear=True)
+    pushed = await _push_config_to_agent(agent_id, push_cfg)
     ip = request.client.host if request.client else ""
     await log_audit(db, user["id"], user["username"], "agent.config_update", "agent", agent_id, agent.name, ip)
     return {"ok": True, "pushed": pushed}
+
+
+@admin_router.post("/agents/{agent_id}/ice-scan")
+async def admin_scan_agent_ice(agent_id: str, user: dict = Depends(require_permission("agent:manage")), db: AsyncSession = Depends(get_db)):
+    """向在线 Agent 下发 ice_scan_req 并等待 network_info 回包（方案 §4.2）。
+    Agent 离线或 5s 未回包 → 409。返回的 report 亦已落库到 config_json.net_info。"""
+    result = await db.execute(select(Agent).where(Agent.id == agent_id))
+    agent = result.scalar_one_or_none()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    if agent.owner_id != user["id"]:
+        raise HTTPException(status_code=403, detail=t("admin.no_operate_others_agent"))
+    from .api_isolated import request_ice_scan
+    report = await request_ice_scan(agent_id)
+    return {"ok": True, "net_info": report}
 
 
 # ════════════════════════════════════════════════════════════
@@ -674,7 +765,7 @@ async def admin_list_coturn(user: dict = Depends(require_permission("coturn:mana
     return {"servers": [
         {
             "id": c.id, "name": c.name, "host": c.host,
-            "port": c.port, "tls_port": c.tls_port, "secret": c.secret,
+            "port": c.port, "tls_port": c.tls_port,             "secret": c.secret if c.owner_id == uid else "",
             "realm": c.realm, "relay_range": c.relay_range,
             "total_quota": c.total_quota, "is_active": c.is_active,
             "is_default": c.is_default,
@@ -743,13 +834,15 @@ async def admin_delete_coturn(coturn_id: str, request: Request, user: dict = Dep
 
 @admin_router.post("/coturn/{coturn_id}/default")
 async def admin_set_default_coturn(coturn_id: str, user: dict = Depends(require_permission("coturn:manage")), db: AsyncSession = Depends(get_db)):
-    # 清除所有默认
-    await db.execute(update(CoturnServer).values(is_default=False))
-    # 设置新的默认
     result = await db.execute(select(CoturnServer).where(CoturnServer.id == coturn_id))
     c = result.scalar_one_or_none()
     if not c:
         raise HTTPException(status_code=404, detail="coturn server not found")
+    if c.owner_id != user["id"]:
+        raise HTTPException(status_code=403, detail=t("admin.no_operate_others_coturn"))
+    # 清除所有默认
+    await db.execute(update(CoturnServer).values(is_default=False))
+    # 设置新的默认
     c.is_default = True
     await db.commit()
     return {"ok": True}
@@ -780,6 +873,8 @@ async def admin_get_coturn_shares(coturn_id: str, user: dict = Depends(require_p
     c = result.scalar_one_or_none()
     if not c:
         raise HTTPException(status_code=404, detail="coturn not found")
+    if c.owner_id != user["id"]:
+        raise HTTPException(status_code=403, detail=t("admin.no_operate_others_coturn"))
     import json
     shared_with = c.shared_with
     usernames = []
@@ -804,6 +899,8 @@ async def admin_get_test_credentials(coturn_id: str, user: dict = Depends(requir
     c = result.scalar_one_or_none()
     if not c:
         raise HTTPException(status_code=404, detail="coturn not found")
+    if c.owner_id != user["id"]:
+        raise HTTPException(status_code=403, detail=t("admin.no_operate_others_coturn"))
     from .auth import generate_turn_credentials
     username, credential = generate_turn_credentials("test", turn_secret=c.secret)
     return {
@@ -897,6 +994,7 @@ done
 
 $SUDO tee /opt/wragent/config/config.json > /dev/null << AGENTEOF
 {{
+  "mode": "agent",
   "server_url": "$SERVER_URL",
   "agent_id": "$AGENT_ID",
   "auth_token": {auth_token_line}
@@ -907,11 +1005,16 @@ AGENTEOF
 $SUDO docker run -d \
   --name wragent \
   --network host \
+  --pid=host \
+  --privileged \
+  -e HOST_CONSOLE=1 \
+  -e PERSIST_BIN=/wragent/wragent \
   --restart unless-stopped \
   -v /opt/wragent/config:/config:rw \
-  -v /opt/wragent/wragent:/src/wragent:ro \
+  -v /opt/wragent:/wragent:rw \
+  -v /:/host:rw \
   alpine:3.20 \
-  sh -c "cp /src/wragent /usr/local/bin/wragent && chmod +x /usr/local/bin/wragent && exec /usr/local/bin/wragent -config /config/config.json"
+  sh -c "cp /wragent/wragent /usr/local/bin/wragent && chmod +x /usr/local/bin/wragent && exec /usr/local/bin/wragent -config /config/config.json"
 
 sleep 3
 echo ""
@@ -970,6 +1073,7 @@ $SUDO systemctl daemon-reload || true
 
 $SUDO tee /opt/wragent/config/config.json > /dev/null << AGENTEOF
 {{
+  "mode": "agent",
   "server_url": "$SERVER_URL",
   "agent_id": "$AGENT_ID",
   "auth_token": {auth_token_line}
@@ -1083,6 +1187,7 @@ fi
 if [ ! -f /opt/wragent/config/config.json ]; then
   $SUDO tee /opt/wragent/config/config.json > /dev/null << EOF
 {{
+  "mode": "agent",
   "server_url": "$SERVER_URL",
   "agent_id": "",
   "auth_token": ""
@@ -1097,11 +1202,16 @@ if [ "$METHOD" = "docker" ]; then
   $SUDO docker run -d \
     --name wragent \
     --network host \
+    --pid=host \
+    --privileged \
+    -e HOST_CONSOLE=1 \
+    -e PERSIST_BIN=/wragent/wragent \
     --restart unless-stopped \
     -v /opt/wragent/config:/config:rw \
-    -v /opt/wragent/wragent:/src/wragent:ro \
+    -v /opt/wragent:/wragent:rw \
+    -v /:/host:rw \
     alpine:3.20 \
-    sh -c "cp /src/wragent /usr/local/bin/wragent && chmod +x /usr/local/bin/wragent && exec /usr/local/bin/wragent -config /config/config.json"
+    sh -c "cp /wragent/wragent /usr/local/bin/wragent && chmod +x /usr/local/bin/wragent && exec /usr/local/bin/wragent -config /config/config.json"
   sleep 3
   echo ""
   echo "=== Agent 已启动 (Docker) ==="
@@ -1212,6 +1322,61 @@ async def deploy_signed_url(req: DeploySignedReq,
     }
 
 
+class DeployShortReq(BaseModel):
+    method: str = "docker"  # 兼容旧前端入参；实际模式由路径段 /a/d/、/a/s/ 决定
+    id: str = ""
+
+
+@deploy_router.post("/agent/short")
+async def deploy_short_link(req: DeployShortReq,
+                            user: dict = Depends(require_permission("agent:manage")),
+                            db: AsyncSession = Depends(get_db)):
+    """模式二短链：签发 8 位 code（落 deploy_links，30 分钟有效、可重复执行）。
+    同一 code 支持两种模式：/a/d/<code> 走 docker，/a/s/<code> 走 systemd。
+    只存 agent_id 不存 token；取脚本时实时查库，重置 token 后旧链自动失效。"""
+    if not req.id:
+        raise HTTPException(status_code=400, detail="Agent ID is required")
+    result = await db.execute(select(Agent).where(Agent.id == req.id))
+    agent = result.scalar_one_or_none()
+    if not agent or not agent.token:
+        raise HTTPException(status_code=404, detail="agent not found")
+    now = int(time.time())
+    await db.execute(delete(DeployLink).where(DeployLink.exp < now))
+    code = secrets.token_urlsafe(6)  # 8 字符 ≈ 48 位熵
+    db.add(DeployLink(
+        code=code, agent_id=req.id, exp=now + DEPLOY_KEY_TTL,
+        created_by=user.get("id", ""),
+        created_at=datetime.now(timezone.utc).isoformat(),
+    ))
+    await db.commit()
+    return {
+        "code": code,
+        "path_docker": f"/a/d/{code}",
+        "path_systemd": f"/a/s/{code}",
+        "expires_in": DEPLOY_KEY_TTL,
+    }
+
+
+@short_router.get("/a/{mode}/{code}")
+async def deploy_short_script(mode: str, code: str,
+                              request: Request = None, db: AsyncSession = Depends(get_db)):
+    """短链部署脚本：mode=d → docker 脚本，mode=s → systemd 脚本。"""
+    if mode not in ("d", "s") or not code or len(code) > 16:
+        raise HTTPException(status_code=404, detail="Not Found")
+    link = (await db.execute(select(DeployLink).where(DeployLink.code == code))).scalar_one_or_none()
+    if not link or link.exp < int(time.time()):
+        raise HTTPException(status_code=404, detail="deploy link expired or not found")
+    agent = (await db.execute(select(Agent).where(Agent.id == link.agent_id))).scalar_one_or_none()
+    if not agent or not agent.token:
+        raise HTTPException(status_code=404, detail="agent not found")
+    config = _get_deploy_config(request)
+    if mode == "s":
+        script = _generate_systemd_script(agent.id, config, agent.token)
+    else:
+        script = _generate_docker_script(agent.id, config, agent.token)
+    return PlainTextResponse(content=script, media_type="text/plain")
+
+
 @deploy_router.get("/install-agent")
 def install_agent_script(method: str = "", request: Request = None):
     """模式一公开安装脚本（Tailscale 式，无账户）。根路径别名见 /install-agent。"""
@@ -1238,60 +1403,84 @@ async def admin_pending_agents(user: dict = Depends(get_current_user)):
     return {"pending": items}
 
 
+def _releases_dir() -> str:
+    """下载产物统一目录（独立存放 wragent/wrgateway 各平台版本）"""
+    return os.environ.get("RELEASES_DIR") or os.environ.get("WRAGENT_DIR") or "/app/releases"
+
+
+def _rel_ver_key(path: str):
+    import re as _re
+    m = _re.search(r"_(\d+)\.(\d+)\.(\d+)", os.path.basename(path))
+    if m:
+        return tuple(int(x) for x in m.groups())
+    return (0, 0, 0)
+
+
+def _release_path(kind: str, suffix: str):
+    """定位 releases 中 {kind}_{VERSION}_{suffix} 最新版本文件(按版本号十进制排序, 避免 2.3.10<2.3.9)"""
+    base = _releases_dir()
+    matches = glob.glob(os.path.join(base, f"{kind}_*_{suffix}"))
+    if not matches:
+        return None
+    return max(matches, key=_rel_ver_key)
+
+
+_PLATFORM_SUFFIX = {
+    "linux-amd64": "linux_amd64",
+    "linux-arm64": "linux_arm64",
+    "windows-amd64": "windows_amd64.exe",
+}
+
+
 @deploy_router.get("/wragent")
 def deploy_wragent_binary(arch: str = "amd64"):
-    base = os.environ.get("WRAGENT_DIR", "/app/wragent")
-    mapping = {
-        "amd64": "wragent",
-        "arm64": "wragent-arm64",
-    }
-    filename = mapping.get(arch)
-    if not filename:
+    suffix = {"amd64": "linux_amd64", "arm64": "linux_arm64"}.get(arch)
+    if not suffix:
         raise HTTPException(status_code=400, detail="unsupported arch")
-    path = os.path.join(base, filename)
-    if os.path.isfile(path):
+    path = _release_path("pyagent", suffix)
+    if path:
         from fastapi.responses import FileResponse
-        return FileResponse(path=path, filename=f"wragent-{arch}", media_type="application/octet-stream")
+        return FileResponse(path=path, filename=os.path.basename(path), media_type="application/octet-stream")
     raise HTTPException(status_code=404, detail="wragent binary not found")
 
 
 @deploy_router.get("/wragent/{platform}")
 def download_wragent(platform: str):
-    """下载 wragent 二进制文件 (linux-amd64 / windows-amd64)"""
-    base = os.environ.get("WRAGENT_DIR", "/app/wragent")
-    mapping = {
-        "linux-amd64": "wragent",
-        "linux-arm64": "wragent-arm64",
-        "windows-amd64": "wragent.exe",
-    }
-    filename = mapping.get(platform)
-    if not filename:
+    """下载 wragent 二进制文件 (linux-amd64 / linux-arm64 / windows-amd64)"""
+    suffix = _PLATFORM_SUFFIX.get(platform)
+    if not suffix:
         raise HTTPException(status_code=400, detail="unsupported platform")
-    path = os.path.join(base, filename)
-    if os.path.isfile(path):
+    path = _release_path("pyagent", suffix)
+    if path:
         from fastapi.responses import FileResponse
-        ext = ".exe" if "windows" in platform else ""
-        return FileResponse(path=path, filename=f"wragent-{platform}{ext}", media_type="application/octet-stream")
+        return FileResponse(path=path, filename=os.path.basename(path), media_type="application/octet-stream")
     raise HTTPException(status_code=404, detail="binary not found")
 
 
 @deploy_router.get("/wrgateway/{platform}")
 def download_wrgateway(platform: str):
-    """下载 wrgateway 二进制文件 (linux-amd64 / windows-amd64)"""
-    base = os.environ.get("WRGATEWAY_DIR", "/app/wrgateway")
-    mapping = {
-        "linux-amd64": "wrgateway",
-        "windows-amd64": "wrgateway.exe",
-    }
-    filename = mapping.get(platform)
-    if not filename:
+    """下载 wrgateway 二进制文件 (linux-amd64 / linux-arm64 / windows-amd64)"""
+    suffix = _PLATFORM_SUFFIX.get(platform)
+    if not suffix:
         raise HTTPException(status_code=400, detail="unsupported platform")
-    path = os.path.join(base, filename)
-    if os.path.exists(path):
+    path = _release_path("pyagent", suffix)
+    if path:
         from fastapi.responses import FileResponse
-        ext = ".exe" if "windows" in platform else ""
-        return FileResponse(path=path, filename=f"wrgateway-{platform}{ext}", media_type="application/octet-stream")
+        return FileResponse(path=path, filename=os.path.basename(path), media_type="application/octet-stream")
     raise HTTPException(status_code=404, detail="binary not found")
+
+
+@deploy_router.get("/pyagent/{platform}")
+def download_pyagent(platform: str):
+    """下载 pyagent 单二进制文件 (linux-amd64 / linux-arm64 / windows-amd64)"""
+    suffix = _PLATFORM_SUFFIX.get(platform)
+    if not suffix:
+        raise HTTPException(status_code=400, detail="unsupported platform")
+    path = _release_path("pyagent", suffix)
+    if path:
+        from fastapi.responses import FileResponse
+        return FileResponse(path=path, filename=os.path.basename(path), media_type="application/octet-stream")
+    raise HTTPException(status_code=404, detail="pyagent binary not found")
 
 
 # ════════════════════════════════════════════════════════════
@@ -1344,7 +1533,7 @@ async def admin_list_gateways(user: dict = Depends(require_permission("agent:man
         _ver = g.version if _online_ver in ("", "unknown") else _online_ver
         _needs_upgrade, _latest_version = _check_version_upgrade("gateway", _ver)
         gw_list.append({
-            "id": g.id, "name": g.name, "url": g.url, "token": g.token,
+            "id": g.id, "name": g.name, "url": g.url, "token": g.token if is_owner else "",
             "remark": g.remark, "is_active": g.is_active,
             "online": bool(online_info),
             "owner_id": g.owner_id, "owner_name": owner_name if not is_owner else "",
@@ -1463,6 +1652,8 @@ async def admin_get_gateway_shares(gateway_id: str, user: dict = Depends(require
     gw = result.scalar_one_or_none()
     if not gw:
         raise HTTPException(status_code=404, detail="Gateway not found")
+    if gw.owner_id != user["id"]:
+        raise HTTPException(status_code=403, detail=t("admin.no_operate_others_gateway"))
     import json
     shared_with = gw.shared_with
     usernames = []

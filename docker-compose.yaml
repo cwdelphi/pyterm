@@ -70,6 +70,7 @@ services:
     - MINIO_ACCESS_KEY=minioadmin
     - MINIO_SECRET_KEY=change_me_minio
     - MINIO_BUCKET=pyterm-docs
+    - RELEASES_DIR=/app/releases
     image: pyterm/md:latest
     restart: unless-stopped
     volumes:
@@ -79,10 +80,7 @@ services:
     - ./config:/app/config
     - ./logs:/app/logs
     - ./md:/app/md
-    - ./wragent/wragent:/app/wragent/wragent:ro
-    - ./wragent/wragent-windows-amd64.exe:/app/wragent/wragent.exe:ro
-    - ./wrgateway/wrgateway:/app/wrgateway/wrgateway:ro
-    - ./wrgateway/wrgateway-windows-amd64.exe:/app/wrgateway/wrgateway.exe:ro
+    - ./releases:/app/releases:ro
     - /etc/localtime:/etc/localtime:ro
     - /etc/timezone:/etc/timezone:ro
   minio:
@@ -179,28 +177,67 @@ services:
     - '5900:5900'
     - '3389:3389'
     restart: unless-stopped
+  # pyagent 单二进制（agent+gateway 双模式，mode 由各自 config.json 决定）
+  # 三个实例共用 pyterm/pyagent:latest 与同一份 ./pyagent/pyagent 二进制
   wragent:
-    image: pyterm/go-runtime:latest
+    image: pyterm/pyagent:latest
+    build:
+      context: ./pyagent
+      dockerfile: Dockerfile
     container_name: pyterm_wragent
     environment:
+    - GOMEMLIMIT=256MiB
+    - PYAGENT_PPROF_ADDR=127.0.0.1:6061
     - TZ=Asia/Shanghai
-    entrypoint: [/app/wragent]
-    command: [-config, /config.json]
+    - HOST_CONSOLE=1
+    - PERSIST_BIN=/app/pyagent
+    - PION_LOG_DEBUG=${PION_LOG_DEBUG:-}
+    - PION_LOG_TRACE=${PION_LOG_TRACE:-}
+    command: sh -c "cp /app/pyagent /usr/local/bin/pyagent && exec /usr/local/bin/pyagent -config /config.json"
     network_mode: host
+    pid: host
+    privileged: true
     restart: unless-stopped
     volumes:
-    - ./wragent/wragent:/app/wragent:ro
-    - ./wragent/config.json:/config.json
+    - ./pyagent/pyagent:/app/pyagent
+    - ./pyagent/config.json:/config.json
+    - /:/host:rw
+  wragent2:
+    image: pyterm/pyagent:latest
+    build:
+      context: ./pyagent
+      dockerfile: Dockerfile
+    container_name: pyterm_wragent2
+    environment:
+    - GOMEMLIMIT=256MiB
+    - PYAGENT_PPROF_ADDR=127.0.0.1:6062
+    - TZ=Asia/Shanghai
+    - HOST_CONSOLE=1
+    - PERSIST_BIN=/app/pyagent
+    command: sh -c "cp /app/pyagent /usr/local/bin/pyagent && exec /usr/local/bin/pyagent -config /config2.json"
+    network_mode: host
+    pid: host
+    privileged: true
+    restart: unless-stopped
+    volumes:
+    - ./pyagent/pyagent:/app/pyagent
+    - ./pyagent/config2.json:/config2.json
+    - /:/host:rw
   wrgateway:
-    image: pyterm/go-runtime:latest
+    image: pyterm/pyagent:latest
+    build:
+      context: ./pyagent
+      dockerfile: Dockerfile
     container_name: pyterm_wrgateway
     environment:
+    - GOMEMLIMIT=256MiB
+    - PYAGENT_PPROF_ADDR=127.0.0.1:6060
     - TZ=Asia/Shanghai
-    entrypoint: [/app/wrgateway]
-    command: [-config, /etc/wrgateway/config.json]
+    - PERSIST_BIN=/app/pyagent
+    command: sh -c "cp /app/pyagent /usr/local/bin/pyagent && exec /usr/local/bin/pyagent -config /etc/pyagent/config.json"
     network_mode: host
     restart: unless-stopped
     volumes:
-    - ./wrgateway/wrgateway:/app/wrgateway:ro
-    - ./wrgateway/config.json:/etc/wrgateway/config.json
-    - ./wrgateway/ssl:/etc/wrgateway/ssl:ro
+    - ./pyagent/pyagent:/app/pyagent
+    - ./pyagent/config-gateway.json:/etc/pyagent/config.json
+    - ./pyagent/ssl:/etc/pyagent/ssl:ro

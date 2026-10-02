@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { renderDoc, type TocItem } from '../markdown'
+import { renderDoc } from '../markdown'
 
 describe('renderDoc', () => {
   it('renders simple markdown', () => {

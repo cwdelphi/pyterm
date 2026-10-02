@@ -2,37 +2,30 @@
  * WebRTC工具模块 - 支持DataChannel消息前缀协议
  */
 
-import { log, LogLevel } from './logger'
+import { log, LogLevel, getLogLevel } from './logger'
 
-export const MSG_TERMINAL = 0x00
-export const MSG_SSH_CONNECT = 0x01
-export const MSG_RESIZE = 0x02
-export const MSG_ACK = 0x03
-export const MSG_SFTP_REQUEST = 0x10
-export const MSG_SFTP_RESPONSE = 0x11
-// SFTP 分片传输：DataChannel 单条消息上限 65536 字节（pion 与浏览器 SCTP 一致），
-// 超限会被 pion 拒绝（outbound packet larger than maximum message size），
-// 因此读写请求/响应超过阈值时分片发送，按 req_id 重组。
-export const SFTP_SINGLE_LIMIT = 32 * 1024
-export const SFTP_CHUNK_SIZE = 24 * 1024
-export const MSG_VNC_CONNECT = 0x20
-export const MSG_VNC_DATA = 0x21
-export const MSG_VNC_DISCONNECT = 0x22
-export const MSG_VNC_INPUT = 0x23
-export const MSG_VNC_RESIZE = 0x24
-export const MSG_VNC_CLIPBOARD = 0x25
-export const MSG_VNC_ERROR = 0x2F
-export const MSG_ERROR = 0xFF
-
-// Uint8Array -> base64（分片传输用，分块避免超大字符串一次性转换）
-function bytesToBase64(bytes: Uint8Array): string {
-  let bin = ''
-  const CHUNK = 0x8000
-  for (let i = 0; i < bytes.length; i += CHUNK) {
-    bin += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + CHUNK)) as unknown as number[])
-  }
-  return btoa(bin)
+// 协议 v2.0：帧常量/名称表/编码器统一在 ./frame.ts（单一事实源），此处 re-export 保持既有引用不变
+import {
+  MSG_TERMINAL, MSG_SSH_CONNECT, MSG_RESIZE, MSG_ACK,
+  MSG_SFTP_REQUEST, MSG_SFTP_RESPONSE,
+  MSG_VNC_CONNECT, MSG_VNC_DATA, MSG_VNC_DISCONNECT, MSG_VNC_INPUT,
+  MSG_VNC_RESIZE, MSG_VNC_CLIPBOARD, MSG_VNC_ERROR, MSG_ERROR,
+  MSG_NAMES, prefixHex, frame1, writeU32BE, FrameScratch,
+  SFTP_SUB_META, SFTP_SUB_CHUNK, SFTP_OP_CODE,
+  sftpCmdFrame, sftpUploadFrame, parseSftpResp, sftpMetaBytes, sftpChunkParts,
+  sftpWireFrame,
+  nextSftpReqId, SFTP_CHUNK_SIZE,
+} from './frame'
+export {
+  MSG_TERMINAL, MSG_SSH_CONNECT, MSG_RESIZE, MSG_ACK,
+  MSG_SFTP_REQUEST, MSG_SFTP_RESPONSE,
+  MSG_VNC_CONNECT, MSG_VNC_DATA, MSG_VNC_DISCONNECT, MSG_VNC_INPUT,
+  MSG_VNC_RESIZE, MSG_VNC_CLIPBOARD, MSG_VNC_ERROR, MSG_ERROR,
+  MSG_NAMES, prefixHex, SFTP_CHUNK_SIZE,
 }
+
+/** VNC 断开帧（type + 1B 0 payload），定长故模块级只分配一次 */
+const VNC_DISCONNECT_FRAME = new Uint8Array([MSG_VNC_DISCONNECT, 0x00])
 
 export interface AgentInfo {
   id: string
@@ -162,7 +155,7 @@ class SharedDirectSignal {
     }
   }
 
-  send(roomId: string, payload: any): boolean {
+  send(_roomId: string, payload: any): boolean {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false
     try {
       this.ws.send(JSON.stringify(payload))
@@ -224,6 +217,11 @@ class SharedDirectSignal {
       try { msg = JSON.parse(ev.data as string) } catch { return }
       if (msg.type === "heartbeat_ack") {
         this.lastAckAt = Date.now()
+        // L2: 服务端回显 ts → 信令 RTT
+        if (typeof msg.ts === "number") {
+          const rtt = this.lastAckAt - msg.ts
+          log(rtt > 500 ? LogLevel.WARN : LogLevel.DEBUG, "SIG-HUB", `heartbeat RTT ${rtt}ms`)
+        }
         return
       }
       const rid = msg.room_id as string | undefined
@@ -273,7 +271,7 @@ class SharedDirectSignal {
     this.stopHeartbeat()
     this.heartbeatTimer = setInterval(() => {
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return
-      try { this.ws.send(JSON.stringify({ type: "heartbeat" })) } catch {}
+      try { this.ws.send(JSON.stringify({ type: "heartbeat", ts: Date.now() })) } catch {}
       // R4: ack 超时 45s（3 个周期）→ 强制重连
       if (this.lastAckAt && Date.now() - this.lastAckAt > 45000) {
         log(LogLevel.WARN, "SIG-HUB", "heartbeat_ack timeout, force reconnect")
@@ -355,6 +353,9 @@ export class WebRTCManager {
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null
   private lastAckAt = 0
   private dcReadyTimeout: ReturnType<typeof setTimeout> | null = null
+  private dcOpenTimeout: ReturnType<typeof setTimeout> | null = null
+  private dcReady: boolean = false
+  private pendingSshConnect: { conn: any; cols: number; rows: number } | null = null
   private onOpenFired: boolean = false
   private diagReported: boolean = false
   private _connType: string = ""
@@ -369,7 +370,8 @@ export class WebRTCManager {
   }
   private sshConnected: boolean = false
   private onSshConnected: (() => void) | null = null
-  private sftpCallbacks: Map<string, {
+  private sftpReqCounter = 0
+  private sftpCallbacks: Map<number, {
     resolve: (v: any) => void
     reject: (e: Error) => void
     timer?: ReturnType<typeof setTimeout>
@@ -377,8 +379,10 @@ export class WebRTCManager {
     timeoutMs?: number
     arm?: () => void
   }> = new Map()
-  // 分片响应重组缓冲：req_id -> 各分片
-  private sftpChunkBuf: Map<string, { parts: (Uint8Array | null)[]; n: number; got: number }> = new Map()
+  // 二进制分片重组缓冲：req_id -> 各分片（0x11 CHUNK 帧）
+  private sftpChunkParts: Map<number, { parts: (Uint8Array | null)[]; cnt: number; got: number }> = new Map()
+  // VNC 键鼠输入专用 scratch：帧是同步 send 且不跨 await 持有，故可复用（见 frame.ts 注释）
+  private vncInputScratch = new FrameScratch()
   // P3: 终端输出 seq 追踪 + 背压丢帧空洞检测 + 节流 ack
   private lastTermSeq = -1
   private termGapTotal = 0
@@ -396,6 +400,16 @@ export class WebRTCManager {
     color_depth?: number
     read_only?: boolean
   } | null = null
+  // DC 桥未就绪时代发的 vnc_connect (镜像 pendingSshConnect, 修复网关模式 10s 兜底竞态)
+  private pendingVncConnect: {
+    host: string
+    port: number
+    password?: string
+    pixel_format?: string
+    color_depth?: number
+    read_only?: boolean
+  } | null = null
+  private vncDeferTimer: ReturnType<typeof setTimeout> | null = null
 
   constructor(token: string, roomId: string) {
     this.token = token
@@ -433,6 +447,11 @@ export class WebRTCManager {
     this.diag.pathMode = this.gatewayId || this.gatewayUrl ? "gateway" : "direct"
     this.intentionalClose = false
     this.reconnectAttempt = 0
+    this.dcReady = false
+    this.pendingSshConnect = null
+    this.pendingVncConnect = null
+    this.clearVncDefer()
+    this.clearVncConnectRetry()
     this.diag.start = performance.now()
     this.diag.wsOpen = 0
     this.diag.signalOk = 0
@@ -499,6 +518,9 @@ export class WebRTCManager {
     }
 
     let wsUrl = this.gatewayUrl
+    // 网关 WS 契约: 服务端 WebSocket 挂在 /ws(并兼容根路径); URL 归一化补齐路径, 避免 404
+    wsUrl = (wsUrl || "").replace(/\/+$/, "")
+    if (wsUrl && !/\/ws$/i.test(wsUrl)) wsUrl += "/ws"
     // S7: JWT 走 Sec-WebSocket-Protocol（浏览器 WS 无法设 Authorization 头），不再拼进 URL/query
     // 回退：无 token 时仍可连（服务端会拒），旧 query 兼容由服务端保留
     if (this.token) {
@@ -533,8 +555,12 @@ export class WebRTCManager {
           if (bin.length >= 1) {
             const prefix = bin[0]
             const payload = bin.slice(1)
-            log(LogLevel.DEBUG, "BG-WS", `binary frame: prefix=0x${prefix.toString(16).padStart(2,'0')} len=${bin.length} hasVncCb=${!!this.onVncData} hasTermCb=${!!this.onTerminalData}`)
+            if (getLogLevel() <= LogLevel.DEBUG) {
+              log(LogLevel.DEBUG, 'BG-WS', `binary frame: prefix=${prefixHex(prefix)} len=${bin.length} hasVncCb=${!!this.onVncData} hasTermCb=${!!this.onTerminalData}`)
+            }
             if (prefix === 0x00) {
+              // 首帧到达即标记已连通(即使无 terminal 回调 — 如 FILE 文件管理), 对齐直连模式语义
+              if (!this.dataChannel || this.dataChannel.readyState !== "open") this.markFirstData()
               if (this.onTerminalData) {
                 this.markFirstData()
                 this.handleTerminalFrame(payload.buffer)
@@ -543,12 +569,14 @@ export class WebRTCManager {
                 log(LogLevel.DEBUG, "BG-WS", `terminal frame dropped (no handler yet): len=${bin.length}`)
               }
             } else if (prefix === 0x21) {
+              this.markFirstData()
               if (this.onVncData) {
-                this.markFirstData()
                 this.onVncData(payload.buffer)
               } else {
                 log(LogLevel.DEBUG, "BG-WS", `vnc frame dropped (no handler yet): len=${bin.length}`)
               }
+            } else if (prefix === 0x11) {
+              this.handleSftpFrame(payload)
             } else if (prefix === 0xFE) {
               try {
                 const text = new TextDecoder().decode(payload)
@@ -562,6 +590,10 @@ export class WebRTCManager {
                 if (msg.agent_ssh_port) this.diag.agent_ssh_port = msg.agent_ssh_port
                 if (msg.error_stage) { this.diag.errorStage = msg.error_stage; this.diag.errorMsg = msg.error_msg || "" }
                 this.markAgentDiagOk(msg)
+                // 网关 FILE：无 terminal 回调时，0xFE 且 shell 已就绪也置位 sshConnected（对齐直连模式）
+                if (msg.agent_connect_ms > 0 && !msg.error_stage && !this.sshConnected && this._connType !== "vnc") {
+                  this.markFirstData()
+                }
                 if (this.diag.firstData > 0) {
                   this.diagReported = false
                   this.reportDiagnostic()
@@ -578,7 +610,9 @@ export class WebRTCManager {
           }
           return
         }
-        log(LogLevel.DEBUG, "BG-WS", `text frame: ${(ev.data as string).substring(0, 120)}`)
+        if (getLogLevel() <= LogLevel.DEBUG) {
+          log(LogLevel.DEBUG, 'BG-WS', `text frame: ${(ev.data as string).substring(0, 120)}`)
+        }
         const msg = JSON.parse(ev.data)
         void this.handleSignal(msg)
       } catch (e) { log(LogLevel.WARN, "BG-WS", `onmessage error:`, e) }
@@ -624,6 +658,8 @@ export class WebRTCManager {
       this.peerConnection = null
       this.onOpenFired = false
       this.sshConnected = false
+      // 信令重连后旧会话/桥失效, DC 就绪状态须复位, 否则 vnc/ssh_connect 会当桥仍可用
+      this.dcReady = false
       this.connectSignal()
     }, delay)
   }
@@ -678,7 +714,9 @@ export class WebRTCManager {
       case "datachannel_ready":
         if (this.gatewayUrl) {
           log(LogLevel.INFO, "BG-WS", "DataChannel ready")
-          if (this.dcReadyTimeout) { clearTimeout(this.dcReadyTimeout); this.dcReadyTimeout = null }
+    if (this.dcReadyTimeout) { clearTimeout(this.dcReadyTimeout); this.dcReadyTimeout = null }
+    if (this.dcOpenTimeout) { clearTimeout(this.dcOpenTimeout); this.dcOpenTimeout = null }
+          this.dcReady = true
           this.diag.dcOpen = performance.now()
           this.diag.rtcConnected = this.diag.rtcConnected || this.diag.dcOpen
           this.diag.pathMode = "gateway"
@@ -688,8 +726,44 @@ export class WebRTCManager {
             this.onOpenFired = true
             if (this.onOpen) this.onOpen()
           }
+          // 若 ssh_connect 曾在 DC 就绪前被缓冲(10s 兜底提前触发 onOpen), 此刻补发
+          if (this.pendingSshConnect) {
+            const p = this.pendingSshConnect
+            this.pendingSshConnect = null
+            log(LogLevel.INFO, "BG-WS", "flushing deferred ssh_connect:", p.conn.username + "@" + p.conn.host + ":" + p.conn.port)
+            this.signalWs?.send(JSON.stringify({
+              type: "ssh_connect", room_id: this.roomId,
+              host: p.conn.host, port: p.conn.port, username: p.conn.username,
+              auth_type: p.conn.auth_type, password: p.conn.password || "", cols: p.cols, rows: p.rows,
+              ...(p.conn.mode ? { mode: p.conn.mode } : {}),
+            }))
+            this.sshConnected = false
+          }
+          // 若 vnc_connect 曾在 DC 就绪前被缓冲(10s 兜底提前触发 onOpen), 此刻补发并启动重试
+          if (this.pendingVncConnect) {
+            const c = this.pendingVncConnect
+            this.pendingVncConnect = null
+            this.clearVncDefer()
+            log(LogLevel.INFO, "BG-WS", "flushing deferred vnc_connect:", c.host + ":" + c.port)
+            this.lastVncConnect = { ...c }
+            this.vncConnectAttempts = 0
+            this.doSendVncConnect(c)
+            this.armVncConnectRetry()
+          }
         }
         break
+      case "connection_type": {
+        // 网关模式：浏览器本地无 RTCPeerConnection，由网关判定 网关↔Agent 的
+        // ICE 选中候选对并回传；直连模式同样可达（网关不发此消息）。
+        const ct = msg.conn_type
+        if (ct === "P2P" || ct === "relay" || ct === "BUG") {
+          log(LogLevel.INFO, this.gatewayUrl ? "BG-WS" : "BS-WS", "conn_type received:", ct)
+          this.diag.connTypeDetected = ct
+          // 已上报过 timeline → 单独补报 DC 链路列；否则随下一次 reportDiagnostic 首报带出
+          if (this.diagReported) this.reportWebRtcPath(ct)
+        }
+        break
+      }
       case "error":
         log(LogLevel.ERROR, this.gatewayUrl ? "BG-WS" : "BS-WS", "error:", msg.detail)
         this.diag.error = performance.now(); this.diag.errorStage = "signal"; this.diag.errorMsg = msg.detail || "连接失败"; this.reportDiagnostic()
@@ -733,12 +807,8 @@ export class WebRTCManager {
           if (!msg.ok && this.onError) this.onError(new Error(msg.detail || "SSH连接失败"))
         }
         break
-      case "sftp_response": {
-        if (this.gatewayUrl) {
-          this.handleSftpResponse(msg)
-        }
-        break
-      }
+      // T1.3+: SFTP 响应走二进制 0x11(网关纯透传), JSON 路径已废弃
+
       case "vnc_data": {
         if (this.gatewayUrl && this.onVncData) {
           this.markFirstData()
@@ -769,12 +839,18 @@ export class WebRTCManager {
         break
       case "heartbeat_ack":
         this.lastAckAt = Date.now()
+        // L2: 服务端回显 ts → 信令 RTT
+        if (typeof msg.ts === "number") {
+          const rtt = this.lastAckAt - msg.ts
+          log(rtt > 500 ? LogLevel.WARN : LogLevel.DEBUG, this.gatewayUrl ? "BG-WS" : "BS-WS", `heartbeat RTT ${rtt}ms`)
+        }
         break
     }
   }
 
   // 关闭旧 Peer/DC 并复位会话标志（重建前调用；不触发 onClose 回调避免 UI 误标断开）
   private closePeerState(): void {
+    if (this.dcOpenTimeout) { clearTimeout(this.dcOpenTimeout); this.dcOpenTimeout = null }
     const oldDc = this.dataChannel
     const oldPc = this.peerConnection
     this.dataChannel = null
@@ -916,7 +992,18 @@ export class WebRTCManager {
   private setupDataChannel(channel: RTCDataChannel): void {
     this.dataChannel = channel
     channel.binaryType = "arraybuffer"
+    // L4: DC open 超时兜底 —— 网关模式已有 dcReadyTimeout, 直连模式此前卡在 connecting 无任何上报
+    if (this.dcOpenTimeout) clearTimeout(this.dcOpenTimeout)
+    this.dcOpenTimeout = setTimeout(() => {
+      this.dcOpenTimeout = null
+      if (this.onOpenFired || channel.readyState === "open") return
+      log(LogLevel.ERROR, "BA-DC", "DataChannel OPEN timeout (10s), stage=dc")
+      this.diag.error = performance.now(); this.diag.errorStage = "dc"; this.diag.errorMsg = "数据通道打开超时"
+      this.reportDiagnostic()
+      if (this.onError) this.onError(new Error("数据通道打开超时"))
+    }, 10000)
     channel.onopen = () => {
+      if (this.dcOpenTimeout) { clearTimeout(this.dcOpenTimeout); this.dcOpenTimeout = null }
       log(LogLevel.INFO, "BA-DC", "DataChannel OPEN:", channel.label)
       this.diag.dcOpen = performance.now()
       this.diag.pathMode = this.gatewayId || this.gatewayUrl ? "gateway" : "direct"
@@ -928,6 +1015,7 @@ export class WebRTCManager {
       }
     }
     channel.onclose = () => {
+      if (this.dcOpenTimeout) { clearTimeout(this.dcOpenTimeout); this.dcOpenTimeout = null }
       log(LogLevel.INFO, "BA-DC", "DataChannel CLOSED:", channel.label)
       this.sshConnected = false
       if (this.onClose) this.onClose()
@@ -947,21 +1035,18 @@ export class WebRTCManager {
     const view = new Uint8Array(data)
     const prefix = view[0]
     const payload = data.slice(1)
-    const prefixNames: Record<number, string> = { 0x00: "TERMINAL", 0x01: "SSH_CONNECT", 0x02: "RESIZE", 0x10: "SFTP_REQ", 0x11: "SFTP_RESP", 0x20: "VNC_CONNECT", 0x21: "VNC_DATA", 0x22: "VNC_INPUT", 0x23: "VNC_RESIZE", 0x24: "VNC_CLIPBOARD", 0x2F: "VNC_ERROR", 0xFF: "ERROR" }
-    log(LogLevel.DEBUG, "BA-DC", "DC recv prefix:", "0x" + prefix.toString(16).padStart(2, "0"), prefixNames[prefix] || "UNKNOWN", "len:", payload.byteLength)
+    // 每条 DC 消息都会走到这里：日志参数必须惰性求值，级别不够时一次都不构造
+    if (getLogLevel() <= LogLevel.DEBUG) {
+      log(LogLevel.DEBUG, 'BA-DC', 'DC recv prefix:', prefixHex(prefix), MSG_NAMES[prefix] || 'UNKNOWN', 'len:', payload.byteLength)
+    }
 
     switch (prefix) {
       case MSG_TERMINAL:
         this.handleTerminalFrame(payload)
         break
-      case MSG_SFTP_RESPONSE: {
-        try {
-          const text = new TextDecoder().decode(payload)
-          const msg = JSON.parse(text)
-          this.handleSftpResponse(msg)
-        } catch {}
+      case MSG_SFTP_RESPONSE:
+        this.handleSftpFrame(new Uint8Array(payload))
         break
-      }
       case MSG_ERROR: {
         try {
           const text = new TextDecoder().decode(payload)
@@ -1066,10 +1151,7 @@ export class WebRTCManager {
   private sendTerminalAck(seq: number): void {
     const buf = new Uint8Array(5)
     buf[0] = MSG_ACK
-    buf[1] = (seq >>> 24) & 0xff
-    buf[2] = (seq >>> 16) & 0xff
-    buf[3] = (seq >>> 8) & 0xff
-    buf[4] = seq & 0xff
+    writeU32BE(buf, 1, seq)
     if (this.gatewayUrl) {
       if (this.signalWs && this.signalWs.readyState === WebSocket.OPEN) {
         this.signalWs.send(buf.buffer)
@@ -1086,18 +1168,12 @@ export class WebRTCManager {
       if (!this.signalWs || this.signalWs.readyState !== WebSocket.OPEN) return
       const bin = typeof data === "string" ? new TextEncoder().encode(data) : new Uint8Array(data)
       // Binary WebSocket frame: [prefix][payload] — zero overhead, no base64/JSON
-      const framed = new Uint8Array(1 + bin.length)
-      framed[0] = MSG_TERMINAL
-      framed.set(bin, 1)
-      this.signalWs.send(framed.buffer)
+      this.signalWs.send(frame1(MSG_TERMINAL, bin).buffer)
       return
     }
     if (!this.dataChannel || this.dataChannel.readyState !== "open") return
     const encoded = typeof data === "string" ? new TextEncoder().encode(data) : new Uint8Array(data)
-    const prefixed = new Uint8Array(1 + encoded.length)
-    prefixed[0] = MSG_TERMINAL
-    prefixed.set(encoded, 1)
-    this.dataChannel.send(prefixed)
+    this.dataChannel.send(frame1(MSG_TERMINAL, encoded))
   }
 
   // --- SSH连接指令 ---
@@ -1116,6 +1192,12 @@ export class WebRTCManager {
         return
       }
       log(LogLevel.INFO, "BG-WS", "sendSshConnect:", (conn.mode === "local" ? "[webterm] " : "") + conn.username + "@" + conn.host + ":" + conn.port)
+      if (!this.dcReady) {
+        // DC 桥未就绪(datachannel_ready 未到, 或 10s 兜底提前触发 onOpen): 缓冲, 待 datachannel_ready 补发, 避免 ssh_connect 提前打入未就绪通道被丢
+        log(LogLevel.WARN, "BG-WS", "sendSshConnect deferred (DC bridge not ready), will flush on datachannel_ready")
+        this.pendingSshConnect = { conn, cols, rows }
+        return
+      }
       this.signalWs.send(JSON.stringify({
         type: "ssh_connect", room_id: this.roomId,
         host: conn.host, port: conn.port, username: conn.username,
@@ -1142,11 +1224,7 @@ export class WebRTCManager {
       rows,
       ...(conn.mode ? { mode: conn.mode } : {}),
     }
-    const encoded = new TextEncoder().encode(JSON.stringify(msg))
-    const prefixed = new Uint8Array(1 + encoded.length)
-    prefixed[0] = MSG_SSH_CONNECT
-    prefixed.set(encoded, 1)
-    this.dataChannel.send(prefixed)
+    this.dataChannel.send(frame1(MSG_SSH_CONNECT, new TextEncoder().encode(JSON.stringify(msg))))
     // R7: 发送时不置位；首帧终端数据或明确成功后由 markFirstData/结果处理
     this.sshConnected = false
   }
@@ -1160,16 +1238,12 @@ export class WebRTCManager {
     }
     if (!this.dataChannel || this.dataChannel.readyState !== "open") return
     const msg = { cols, rows }
-    const encoded = new TextEncoder().encode(JSON.stringify(msg))
-    const prefixed = new Uint8Array(1 + encoded.length)
-    prefixed[0] = MSG_RESIZE
-    prefixed.set(encoded, 1)
-    this.dataChannel.send(prefixed)
+    this.dataChannel.send(frame1(MSG_RESIZE, new TextEncoder().encode(JSON.stringify(msg))))
   }
 
   // --- SFTP请求 ---
   // 注册回调并启动超时；分片到达会调用 arm() 续期（单次间隔仍为 timeoutMs，总时长封顶 4 倍）
-  private trackSftp(reqId: string, resolve: (v: any) => void, reject: (e: Error) => void, timeoutMs: number): void {
+  private trackSftp(reqId: number, resolve: (v: any) => void, reject: (e: Error) => void, timeoutMs: number): void {
     const entry: { resolve: (v: any) => void; reject: (e: Error) => void; timer?: ReturnType<typeof setTimeout>; startedAt: number; timeoutMs: number; arm?: () => void } =
       { resolve, reject, startedAt: Date.now(), timeoutMs }
     const arm = () => {
@@ -1179,7 +1253,7 @@ export class WebRTCManager {
       entry.timer = setTimeout(() => {
         if (this.sftpCallbacks.has(reqId)) {
           this.sftpCallbacks.delete(reqId)
-          this.sftpChunkBuf.delete(reqId)
+          this.sftpChunkParts.delete(reqId)
           reject(new Error("SFTP请求超时"))
         }
       }, wait)
@@ -1190,61 +1264,74 @@ export class WebRTCManager {
   }
 
   // 统一处理 SFTP 响应：分片先重组，完整消息再触发回调
-  private handleSftpResponse(msg: any): void {
-    if (msg && msg.chunk) {
-      const full = this.collectSftpChunk(msg)
-      if (!full) return
-      msg = full
+  // 0x11 二进制响应：META(final) 或 CHUNK(内容分片)
+  private handleSftpFrame(payload: Uint8Array): void {
+    const head = parseSftpResp(payload)
+    if (!head) return
+    if (head.sub === SFTP_SUB_META) {
+      const metaBytes = sftpMetaBytes(payload, head.off)
+      if (!metaBytes) return
+      let meta: any
+      try { meta = JSON.parse(new TextDecoder().decode(metaBytes)) } catch { return }
+      this.finishSftp(head.reqId, meta)
+    } else if (head.sub === SFTP_SUB_CHUNK) {
+      const cp = sftpChunkParts(payload, head.off)
+      if (!cp) return
+      this.collectSftpChunkBytes(head.reqId, cp.idx, cp.cnt, cp.raw)
     }
-    const cb = this.sftpCallbacks.get(msg.req_id)
-    if (cb) {
-      this.sftpCallbacks.delete(msg.req_id)
-      this.sftpChunkBuf.delete(msg.req_id)
-      if (cb.timer) clearTimeout(cb.timer)
-      if (msg.ok) cb.resolve(msg)
-      else cb.reject(new Error(msg.detail || "SFTP操作失败"))
-    }
-    if (this.onSftpResponse) this.onSftpResponse(msg)
   }
 
-  // 收集分片；收齐后拼装并解析出完整响应（未收齐返回 null）
-  private collectSftpChunk(msg: any): any | null {
-    const reqId = msg.req_id
-    const c = msg.chunk
-    if (!reqId || !c || typeof c.i !== 'number' || typeof c.n !== 'number') return null
-    let buf = this.sftpChunkBuf.get(reqId)
-    if (!buf) {
-      buf = { parts: new Array(c.n).fill(null), n: c.n, got: 0 }
-      this.sftpChunkBuf.set(reqId, buf)
+  // 收集 CHUNK 分片；到达即续期超时（分片越多耗时越长）
+  private collectSftpChunkBytes(reqId: number, idx: number, cnt: number, raw: Uint8Array): void {
+    let buf = this.sftpChunkParts.get(reqId)
+    if (!buf || buf.cnt !== cnt) {
+      buf = { parts: new Array(cnt).fill(null), cnt, got: 0 }
+      this.sftpChunkParts.set(reqId, buf)
     }
-    if (c.i >= 0 && c.i < buf.n && buf.parts[c.i] == null) {
-      try {
-        const bin = atob(c.data)
-        const bytes = new Uint8Array(bin.length)
-        for (let k = 0; k < bin.length; k++) bytes[k] = bin.charCodeAt(k)
-        buf.parts[c.i] = bytes
-        buf.got++
-      } catch {
-        return null
-      }
+    if (idx >= 0 && idx < cnt && buf.parts[idx] == null) {
+      buf.parts[idx] = raw
+      buf.got++
     }
     const cb = this.sftpCallbacks.get(reqId)
     if (cb && cb.arm) cb.arm()
-    if (buf.got < buf.n) return null
-    this.sftpChunkBuf.delete(reqId)
-    try {
-      let total = 0
-      for (const p of buf.parts) total += p ? p.length : 0
-      const all = new Uint8Array(total)
-      let off = 0
-      for (const p of buf.parts) {
-        if (p) { all.set(p, off); off += p.length }
+  }
+
+  // META 收尾：op=read → content 为 raw 字节；其余 → JSON.parse 分片后合并
+  private finishSftp(reqId: number, meta: any): void {
+    const buf = this.sftpChunkParts.get(reqId)
+    const cb = this.sftpCallbacks.get(reqId)
+    if (cb) {
+      this.sftpCallbacks.delete(reqId)
+      this.sftpChunkParts.delete(reqId)
+      if (cb.timer) clearTimeout(cb.timer)
+      if (!meta.ok) { cb.reject(new Error(meta.detail || "SFTP操作失败")); return }
+      if (meta.op === 'read') {
+        let content = new Uint8Array(0)
+        if (buf && buf.got >= buf.cnt) {
+          let total = 0
+          for (const p of buf.parts) total += p ? p.length : 0
+          content = new Uint8Array(total)
+          let off = 0
+          for (const p of buf.parts) { if (p) { content.set(p, off); off += p.length } }
+        }
+        cb.resolve({ ok: true, path: meta.path, content })
+        return
       }
-      return JSON.parse(new TextDecoder().decode(all))
-    } catch (e) {
-      log(LogLevel.WARN, "BA-DC", "SFTP chunk assemble failed:", e)
-      return null
+      if (buf && buf.got >= buf.cnt) {
+        let total = 0
+        for (const p of buf.parts) total += p ? p.length : 0
+        const all = new Uint8Array(total)
+        let off = 0
+        for (const p of buf.parts) { if (p) { all.set(p, off); off += p.length } }
+        try {
+          const inner = JSON.parse(new TextDecoder().decode(all))
+          cb.resolve({ ...meta, ...inner })
+          return
+        } catch {}
+      }
+      cb.resolve(meta)
     }
+    if (this.onSftpResponse) this.onSftpResponse(meta)
   }
 
   sendSftpRequest(op: string, params: Record<string, any> = {}): Promise<any> {
@@ -1272,41 +1359,47 @@ export class WebRTCManager {
         log(LogLevel.INFO, "BA-DC", "sendSftpRequest:", op, params.path || params.old_path || "")
       }
 
-      const reqId = crypto.randomUUID()
+      const opCode = SFTP_OP_CODE[op]
+      if (opCode === undefined) { reject(new Error("未知 SFTP 操作: " + op)); return }
+
+      // 4B 计数器 reqId（替代 UUID 字符串，帧内省 32 字节 + 免字符串键）
+      const reqId = (this.sftpReqCounter = nextSftpReqId(this.sftpReqCounter))
+
+      const meta: Record<string, any> = {}
+      if (params.path !== undefined) meta.path = params.path
+      if (params.old_path !== undefined) meta.old_path = params.old_path
+      if (params.new_name !== undefined) meta.new_name = params.new_name
+
+      // content 契约：Uint8Array/ArrayBuffer 为 raw；字符串按 UTF-8（兼容既有调用方）
+      const c = params.content
+      const content: Uint8Array = c instanceof Uint8Array ? c
+        : c instanceof ArrayBuffer ? new Uint8Array(c)
+        : typeof c === 'string' ? new TextEncoder().encode(c)
+        : new Uint8Array(0)
+
       this.trackSftp(reqId, resolve, reject, timeoutMs)
 
-      const sendJson = (obj: Record<string, any>) => {
-        if (isGateway) {
-          this.signalWs!.send(JSON.stringify(obj))
-          return
-        }
-        const encoded = new TextEncoder().encode(JSON.stringify(obj))
-        const prefixed = new Uint8Array(1 + encoded.length)
-        prefixed[0] = MSG_SFTP_REQUEST
-        prefixed.set(encoded, 1)
-        this.dataChannel!.send(prefixed)
+      const sendBinary = (body: Uint8Array<ArrayBuffer>) => {
+        // [0x10][body]：缺前缀会被对端当 MsgTerminal(0x00) 吞掉，见 sftpWireFrame
+        const wire = sftpWireFrame(body)
+        if (isGateway) this.signalWs!.send(wire)
+        else this.dataChannel!.send(wire)
       }
 
-      const msg: Record<string, any> = isGateway
-        ? { type: "sftp_request", room_id: this.roomId, op, req_id: reqId, ...params }
-        : { type: "sftp", op, req_id: reqId, ...params }
-      const encoded = new TextEncoder().encode(JSON.stringify(msg))
-      if (encoded.length <= SFTP_SINGLE_LIMIT) {
-        sendJson(msg)
-        return
+      if (op === 'write' && content.byteLength > 0) {
+        // 大内容：UPLOAD 分片（[0x10][sub=1][reqId][idx][cnt][raw]）→ 最后 CMD 触发处理
+        const cnt = Math.ceil(content.byteLength / SFTP_CHUNK_SIZE)
+        meta.chunks = cnt
+        for (let i = 0; i < cnt; i++) {
+          const s = i * SFTP_CHUNK_SIZE
+          const raw = content.subarray(s, Math.min(s + SFTP_CHUNK_SIZE, content.byteLength))
+          sendBinary(sftpUploadFrame(reqId, i, cnt, raw))
+        }
+        sendBinary(sftpCmdFrame(opCode, reqId, new TextEncoder().encode(JSON.stringify(meta))))
+      } else {
+        if (op === 'write') meta.chunks = 0
+        sendBinary(sftpCmdFrame(opCode, reqId, new TextEncoder().encode(JSON.stringify(meta))))
       }
-      // 超过单条 DC 上限：分片发送，末条为不含 content 的装配指令（chunks=n）
-      const n = Math.ceil(encoded.length / SFTP_CHUNK_SIZE)
-      for (let i = 0; i < n; i++) {
-        const s = i * SFTP_CHUNK_SIZE
-        const bytes = encoded.subarray(s, Math.min(s + SFTP_CHUNK_SIZE, encoded.length))
-        sendJson({ type: msg.type, room_id: msg.room_id, op, req_id: reqId, chunk: { i, n, data: bytesToBase64(bytes) } })
-      }
-      const finalMsg: Record<string, any> = { ...msg }
-      delete finalMsg.content
-      finalMsg.chunks = n
-      sendJson(finalMsg)
-      log(LogLevel.INFO, isGateway ? "BG-WS" : "BA-DC", "sendSftpRequest chunked:", n, "chunks, op =", op, "bytes =", encoded.length)
     })
   }
 
@@ -1321,6 +1414,15 @@ export class WebRTCManager {
   }): void {
     this.lastVncConnect = { ...conn }
     this.vncConnectAttempts = 0
+    if (this.gatewayUrl && !this.dcReady) {
+      // DC 桥未就绪(datachannel_ready 未到, 或 10s 兜底提前触发 onOpen):
+      // 缓冲待 datachannel_ready 补发, 避免 vnc_connect 提前打进未 Open 的通道被丢
+      // (网关曾只判 dc==nil → pion ensureOpen 报错被忽略 → 3 次重试全丢 → VNC连接超时)
+      this.pendingVncConnect = { ...conn }
+      log(LogLevel.WARN, "BG-WS", "sendVncConnect deferred (DC bridge not ready), will flush on datachannel_ready")
+      this.armVncConnectDefer()
+      return
+    }
     this.doSendVncConnect(conn)
     this.armVncConnectRetry()
   }
@@ -1363,26 +1465,23 @@ export class WebRTCManager {
       color_depth: conn.color_depth || 32,
       read_only: conn.read_only || false,
     }
-    const encoded = new TextEncoder().encode(JSON.stringify(msg))
-    const prefixed = new Uint8Array(1 + encoded.length)
-    prefixed[0] = MSG_VNC_CONNECT
-    prefixed.set(encoded, 1)
-    this.dataChannel.send(prefixed)
+    this.dataChannel.send(frame1(MSG_VNC_CONNECT, new TextEncoder().encode(JSON.stringify(msg))))
   }
 
   // agent 未回 0x20/vnc_connect_result 时重发（OnMessage 注册竞态兜底）
   private armVncConnectRetry(): void {
     this.clearVncConnectRetry()
+    const tag = this.gatewayUrl ? "BG-WS" : "BA-DC"
     this.vncConnectRetryTimer = setTimeout(() => {
       this.vncConnectRetryTimer = null
       if (!this.lastVncConnect) return
       if (this.vncConnectAttempts >= 3) {
-        log(LogLevel.WARN, "BA-DC", "vnc_connect no ack after 3 retries, giving up")
+        log(LogLevel.WARN, tag, "vnc_connect no ack after 3 retries, giving up")
         if (this.onError) this.onError(new Error("VNC连接超时"))
         return
       }
       this.vncConnectAttempts++
-      log(LogLevel.WARN, "BA-DC", `vnc_connect no ack, retry #${this.vncConnectAttempts}`)
+      log(LogLevel.WARN, tag, `vnc_connect no ack, retry #${this.vncConnectAttempts}`)
       this.doSendVncConnect(this.lastVncConnect)
       this.armVncConnectRetry()
     }, 1500)
@@ -1395,6 +1494,25 @@ export class WebRTCManager {
     }
   }
 
+  // 缓冲期看门狗: datachannel_ready 迟迟不来时给出明确错误, 而非无限等待
+  private armVncConnectDefer(): void {
+    this.clearVncDefer()
+    this.vncDeferTimer = setTimeout(() => {
+      this.vncDeferTimer = null
+      if (!this.pendingVncConnect) return
+      this.pendingVncConnect = null
+      log(LogLevel.WARN, "BG-WS", "vnc_connect defer timeout: datachannel_ready 未到达")
+      if (this.onError) this.onError(new Error("VNC连接超时: 数据通道未就绪"))
+    }, 30000)
+  }
+
+  private clearVncDefer(): void {
+    if (this.vncDeferTimer) {
+      clearTimeout(this.vncDeferTimer)
+      this.vncDeferTimer = null
+    }
+  }
+
   private onVncConnectAck(ok: boolean, detail?: string): void {
     this.clearVncConnectRetry()
     this.vncConnectAttempts = 0
@@ -1403,27 +1521,23 @@ export class WebRTCManager {
 
   // --- VNC输入事件 ---
   sendVncInput(data: ArrayBuffer): void {
+    // T1.2: VNC 上行改 raw —— 网关模式与直连 DC 模式统一走 [0x23][raw RFB] 二进制帧。
+    // 网关收到二进制帧按「帧头+payload」原样转 DC（handler.go 二进制分支），
+    // 免去原来的 JSON 封装 + 逐字节字符串拼接 + btoa（每鼠标事件一次 O(n) 拼接）。
+    // 鼠标移动是最高频路径：帧头+payload 一次 prepare 完成，稳态下零分配。
+    const src = new Uint8Array(data)
+    const out = this.vncInputScratch.prepare(MSG_VNC_INPUT, src.byteLength)
+    out.set(src, 1)
     if (this.gatewayUrl) {
       if (!this.signalWs || this.signalWs.readyState !== WebSocket.OPEN) {
         log(LogLevel.WARN, "BG-WS", `sendVncInput BLOCKED: ws=${!!this.signalWs} readyState=${this.signalWs?.readyState}`)
         return
       }
-      // Gateway expects JSON text: { type: "vnc_input", data: "<base64>" }
-      const bin = new Uint8Array(data)
-      let binary = ''
-      for (let i = 0; i < bin.length; i++) binary += String.fromCharCode(bin[i])
-      const b64 = btoa(binary)
-      const msg = { type: 'vnc_input', data: b64, room_id: this.roomId }
-      log(LogLevel.DEBUG, "BG-WS", `sendVncInput: ${bin.length} bytes (JSON)`)
-      this.signalWs.send(JSON.stringify(msg))
+      this.signalWs.send(out)
       return
     }
     if (!this.dataChannel || this.dataChannel.readyState !== "open") return
-    const encoded = new Uint8Array(data)
-    const prefixed = new Uint8Array(1 + encoded.length)
-    prefixed[0] = MSG_VNC_INPUT
-    prefixed.set(encoded, 1)
-    this.dataChannel.send(prefixed)
+    this.dataChannel.send(out)
   }
 
   // --- VNC断开连接 ---
@@ -1434,8 +1548,7 @@ export class WebRTCManager {
       return
     }
     if (!this.dataChannel || this.dataChannel.readyState !== "open") return
-    const prefixed = new Uint8Array([MSG_VNC_DISCONNECT, 0x00])
-    this.dataChannel.send(prefixed)
+    this.dataChannel.send(VNC_DISCONNECT_FRAME)
   }
 
   // --- VNC窗口调整 ---
@@ -1447,11 +1560,7 @@ export class WebRTCManager {
     }
     if (!this.dataChannel || this.dataChannel.readyState !== "open") return
     const msg = { width, height }
-    const encoded = new TextEncoder().encode(JSON.stringify(msg))
-    const prefixed = new Uint8Array(1 + encoded.length)
-    prefixed[0] = MSG_VNC_RESIZE
-    prefixed.set(encoded, 1)
-    this.dataChannel.send(prefixed)
+    this.dataChannel.send(frame1(MSG_VNC_RESIZE, new TextEncoder().encode(JSON.stringify(msg))))
   }
 
   // --- VNC剪贴板 ---
@@ -1463,11 +1572,7 @@ export class WebRTCManager {
     }
     if (!this.dataChannel || this.dataChannel.readyState !== "open") return
     const msg = { text }
-    const encoded = new TextEncoder().encode(JSON.stringify(msg))
-    const prefixed = new Uint8Array(1 + encoded.length)
-    prefixed[0] = MSG_VNC_CLIPBOARD
-    prefixed.set(encoded, 1)
-    this.dataChannel.send(prefixed)
+    this.dataChannel.send(frame1(MSG_VNC_CLIPBOARD, new TextEncoder().encode(JSON.stringify(msg))))
   }
 
   // --- 原始发送 (兼容旧代码) ---
@@ -1572,10 +1677,42 @@ export class WebRTCManager {
       this.diag.connTypeDetected = connType
       log(LogLevel.INFO, "BA-DC", "Final connection type:", connType)
       report(connType)
+      // 检测常晚于首包触发的一次性 reportDiagnostic：已上报则单独补报 DC 链路列
+      if (this.diagReported) this.reportWebRtcPath(connType)
     } catch (e) {
       log(LogLevel.WARN, "BA-DC", "detectConnType failed:", e)
+      this.diag.connTypeDetected = "BUG"
       report("BUG")
+      if (this.diagReported) this.reportWebRtcPath("BUG")
     }
+  }
+
+  /** 补报 DC 链路标注（P2P/relay/BUG）：只更新 webrtc_path 列，不重算时序步骤 */
+  private reportWebRtcPath(path: string, attempt = 0) {
+    if (!path || !this.roomId) return
+    try {
+      const token = localStorage.getItem("token")
+      fetch("/api/timeline/webrtc-path", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: "Bearer " + token } : {}),
+        },
+        body: JSON.stringify({ room_id: this.roomId, webrtc_path: path }),
+      })
+        .then(r => {
+          if (r.ok) return
+          console.error("[DIAG] webrtc-path report failed:", r.status, r.statusText)
+          // 404/409 = 首报尚未落库的竞态：1.5s 后重试一次（attempt 上限防循环）
+          if (attempt === 0 && (r.status === 404 || r.status === 409)) {
+            setTimeout(() => this.reportWebRtcPath(path, attempt + 1), 1500)
+          }
+        })
+        .catch(e => {
+          console.error("[DIAG] webrtc-path report error:", e)
+          if (attempt === 0) setTimeout(() => this.reportWebRtcPath(path, attempt + 1), 1500)
+        })
+    } catch {}
   }
 
   setConnType(t: string) { this._connType = t }
@@ -1629,6 +1766,7 @@ export class WebRTCManager {
         username: d.username,
         agent_id: this.agentId,
         path_mode: d.pathMode,
+        webrtc_path: d.connTypeDetected || "",
         client_ip: d.client_ip || "",
         agent_2_ip: d.agent_1_ip || "",
         agent_2_name: d.agentName || "",
@@ -1680,7 +1818,7 @@ export class WebRTCManager {
     this.stopHeartbeat()
     this.lastAckAt = Date.now()
     this.heartbeatTimer = setInterval(() => {
-      this.sendSignal({ type: "heartbeat" })
+      this.sendSignal({ type: "heartbeat", ts: Date.now() })
       // R4: 45s 无 ack 视为假活，断开触发重连
       if (this.lastAckAt && Date.now() - this.lastAckAt > 45000) {
         log(LogLevel.WARN, this.gatewayUrl ? "BG-WS" : "BS-WS", "heartbeat_ack timeout")
@@ -1725,12 +1863,16 @@ export class WebRTCManager {
     if (this.dcReadyTimeout) { clearTimeout(this.dcReadyTimeout); this.dcReadyTimeout = null }
     if (this.ackTimer) { clearTimeout(this.ackTimer); this.ackTimer = null }
     this.clearVncConnectRetry()
+    this.clearVncDefer()
     this.lastVncConnect = null
+    this.pendingVncConnect = null
     this.pendingAckSeq = -1
     this.onOpenFired = false
+    this.dcReady = false
+    this.pendingSshConnect = null
     this.diagReported = false
     this.sftpCallbacks.clear()
-    this.sftpChunkBuf.clear()
+    this.sftpChunkParts.clear()
     this.onTerminalData = null
     this.onSftpResponse = null
     this.onVncData = null

@@ -16,12 +16,11 @@ class TestConfig:
 
 
 class TestLogs:
-    def test_get_logs(self):
+    def test_get_logs_requires_auth(self):
+        """S4: 服务端日志只读端点需 system:admin, 匿名 401
+        (admin 200 / 普通用户 403 矩阵见 test_remote_isolation.py::TestS4LogsAuth)"""
         resp = client.get("/api/logs")
-        assert resp.status_code == 200
-        data = resp.json()
-        # api_isolated 返回 {"lines": [...]} 格式
-        assert "lines" in data or "backend" in data
+        assert resp.status_code == 401
 
     def test_post_frontend_log(self):
         resp = client.post("/api/log", json={

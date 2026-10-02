@@ -11,19 +11,40 @@ import AgentConfigModal from './AgentConfigModal.vue'
 const { t } = useI18n()
 const toast = inject<any>('toast')
 
+/* ── 当前账户权限（菜单门禁：普通角色看不到 用户管理/角色管理/审计日志） ── */
+const myRole = ref<string>((() => {
+  try { return JSON.parse(localStorage.getItem('user') || '{}').role || '' } catch { return '' }
+})())
+const myPerms = ref<string[]>([])
+function can(perm?: string): boolean {
+  if (!perm) return true
+  if (myPerms.value.length) return myPerms.value.includes(perm)
+  // 权限未就绪时按角色兜底，避免 admin 菜单闪烁
+  return myRole.value === 'admin'
+}
+async function loadMyPermissions() {
+  try {
+    const data = await api.adminMyPermissions()
+    myPerms.value = data.permissions || []
+    myRole.value = data.role || myRole.value
+  } catch { /* 未登录或接口异常：保持角色兜底 */ }
+}
+
 /* ── 左侧菜单 ── */
-const menuItems = computed(() => [
-  { key: 'agents', label: t('admin.agents'), icon: '🤖' },
-  { key: 'gateways', label: t('admin.gateways'), icon: '🌉' },
-  { key: 'coturn', label: t('admin.coturn'), icon: '🌐' },
-  { key: 'users', label: t('admin.users'), icon: '👥' },
-  { key: 'roles', label: t('admin.roles'), icon: '🔐' },
-  { key: 'audit', label: t('admin.audit'), icon: '📋' },
-  { key: 'settings', label: t('admin.settings'), icon: '⚙️' },
-  { key: 'diagnostics', label: t('admin.diagnostics'), icon: '🔍' },
-  { key: 'downloads', label: t('admin.downloads'), icon: '📥' }
-])
-const activeTab = ref<'users' | 'agents' | 'gateways' | 'coturn' | 'roles' | 'audit' | 'settings' | 'diagnostics' | 'downloads'>('users')
+const menuItems = computed(() => ([
+  { key: 'agents', label: t('admin.agents'), icon: '🤖', perm: 'agent:manage' },
+  { key: 'gateways', label: t('admin.gateways'), icon: '🌉', perm: 'agent:manage' },
+  { key: 'coturn', label: t('admin.coturn'), icon: '🌐', perm: 'coturn:manage' },
+  { key: 'users', label: t('admin.users'), icon: '👥', perm: 'user:manage' },
+  { key: 'roles', label: t('admin.roles'), icon: '🔐', perm: 'user:manage' },
+  { key: 'audit', label: t('admin.audit'), icon: '📋', perm: 'audit:read' },
+  { key: 'settings', label: t('admin.settings'), icon: '⚙️', perm: undefined },
+  { key: 'diagnostics', label: t('admin.diagnostics'), icon: '🔍', perm: undefined },
+  { key: 'downloads', label: t('admin.downloads'), icon: '📥', perm: undefined }
+] as { key: string; label: string; icon: string; perm?: string }[]).filter(m => can(m.perm)))
+const activeTab = ref<'users' | 'agents' | 'gateways' | 'coturn' | 'roles' | 'audit' | 'settings' | 'diagnostics' | 'downloads'>(
+  myRole.value === 'admin' ? 'users' : 'agents'
+)
 
 /* ── 分页通用 ── */
 const pageSize = 10
@@ -65,10 +86,12 @@ const deleteUserName = ref('')
 const configAgentId = ref('')
 const configAgentName = ref('')
 const configAgentOnline = ref<boolean | undefined>(undefined)
+const configAgentReadonly = ref(false)
 function openAgentConfig(a: any) {
   configAgentId.value = a.id
   configAgentName.value = a.name || ''
   configAgentOnline.value = a.online
+  configAgentReadonly.value = a.is_owner === false
 }
 function closeAgentConfig() {
   configAgentId.value = ''
@@ -187,25 +210,23 @@ const showDeployScript = ref(false)
 const deployAgentId = ref('')
 const deployMethod = ref('docker')
 const deployCopied = ref(false)
-const deploySignedPath = ref('')          // 模式二签名 URL（相对路径）
-const deployLoading = ref(false)          // 正在请求签名 URL
+const deployPaths = ref<{ docker: string; systemd: string }>({ docker: '', systemd: '' }) // 模式二短链（/a/d/<code>、/a/s/<code>）
+const deployLoading = ref(false)          // 正在请求短链
 const pendingAgents = ref<any[]>([])      // 待注册 Agent
 
 function getDeployCommandFull(): string {
-  const cmd = deploySignedPath.value
-    ? `curl -fsSL "${window.location.origin}${deploySignedPath.value}" | bash`
-    : ''
-  return cmd
+  const path = deployMethod.value === 'systemd' ? deployPaths.value.systemd : deployPaths.value.docker
+  return path ? `curl -fsSL "${window.location.origin}${path}" | bash` : ''
 }
 
 async function refreshDeployUrl() {
   if (!deployAgentId.value) return
   deployLoading.value = true
-  deploySignedPath.value = ''
+  deployPaths.value = { docker: '', systemd: '' }
   deployCopied.value = false
   try {
-    const r = await api.deployAgentSignedUrl(deployMethod.value, deployAgentId.value)
-    deploySignedPath.value = r.url
+    const r = await api.deployAgentShort(deployAgentId.value)
+    deployPaths.value = { docker: r.path_docker, systemd: r.path_systemd }
   } catch (e: any) {
     toast?.error(e.message || '生成部署链接失败')
   }
@@ -407,15 +428,17 @@ const allUsers = ref<any[]>([])
 const shareSelectedUsers = ref<string[]>([])
 
 async function openShareModal(item: any, type: 'agent' | 'coturn' | 'gateway') {
+  // 防御：非属主不得进入分享流程（按钮已隐藏，这里兜底）
+  if (item?.is_owner === false) return
   shareTarget.value = item
   shareType.value = type
   shareMode.value = item.shared_with === 'all' ? 'all' : item.shared_with === 'private' ? 'private' : 'select'
   shareSelectedUsers.value = []
-  // 获取用户列表
+  // 获取候选用户名单（仅 id+username，agent:manage 即可，不再依赖 admin-only 的 /users）
   try {
-    const data = await api.adminListUsers()
-    allUsers.value = data.users.filter((u: any) => u.id !== item.owner_id)
-  } catch {}
+    const data = await api.adminShareableUsers()
+    allUsers.value = (data.users || []).filter((u: any) => u.id !== item.owner_id)
+  } catch { allUsers.value = [] }
   // 如果是选择用户模式，解析已有共享
   if (shareMode.value === 'select' && item.shared_with && item.shared_with !== 'private' && item.shared_with !== 'all') {
     try {
@@ -428,6 +451,7 @@ async function openShareModal(item: any, type: 'agent' | 'coturn' | 'gateway') {
 
 async function saveShare() {
   if (!shareTarget.value) return
+  if (shareTarget.value.is_owner === false) { showShareModal.value = false; return }
   let sharedWith: string | string[] = shareMode.value === 'select' ? shareSelectedUsers.value : shareMode.value
   try {
     if (shareType.value === 'agent') {
@@ -679,7 +703,16 @@ function onLogLevelChange() {
 let refreshTimer: ReturnType<typeof setInterval> | null = null
 
 onMounted(async () => {
-  await Promise.all([loadUsers(), loadAgents(), loadGateways(), loadCoturn(), loadAudit(), loadRoles(), loadPendingAgents()])
+  await loadMyPermissions()
+  // 权限就绪后兜底：若默认 tab 无权限（如普通角色进系统管理），切到第一个可见项
+  if (!menuItems.value.some(m => m.key === activeTab.value)) {
+    activeTab.value = (menuItems.value[0]?.key as typeof activeTab.value) || 'agents'
+  }
+  // 普通角色不请求 用户/角色/审计 接口 → 消除 403 与错误 toast
+  const jobs: Promise<any>[] = [loadAgents(), loadGateways(), loadCoturn(), loadPendingAgents()]
+  if (can('user:manage')) jobs.push(loadUsers(), loadRoles())
+  if (can('audit:read')) jobs.push(loadAudit())
+  await Promise.all(jobs)
   refreshTimer = setInterval(() => {
     if (activeTab.value === 'agents' && !detectBusy.value) {
       loadAgents()
@@ -693,11 +726,14 @@ onUnmounted(() => {
 })
 
 function switchTab(key: string) {
+  // 菜单已按权限过滤，这里再兜底一次
+  if (!menuItems.value.some(m => m.key === key)) return
   activeTab.value = key as any
   agentSearch.value = ''
 }
 
-watch(deployMethod, () => { if (deployAgentId.value) refreshDeployUrl() })
+// 短链一次签发即含 docker/systemd 两个路径，切模式无需重新请求（仅复位复制态）
+watch(deployMethod, () => { deployCopied.value = false })
 watch(agentGuideStep, (v) => { if (v === 3) refreshDeployUrl() })
 
 function getRoleLabel(role: string): string {
@@ -760,6 +796,7 @@ function fmtAuditTime(ts: string): string {
           <div class="table-header">
             <h3>{{ t('admin.usersMgmt') }}</h3>
             <div style="display:flex;gap:8px;align-items:center">
+              <input v-model="userSearch" :placeholder="t('admin.searchUsername')" class="admin-search" @input="userPagination.resetPage()" />
               <span class="table-count">{{ t('common.total') }} {{ filteredUsers.length }} {{ t('admin.userCount') }}</span>
               <button class="btn danger" :disabled="selectedUserIds.size === 0" @click="batchDeleteUsers">{{ t('admin.batchDelete') }} ({{ selectedUserIds.size }})</button>
             </div>
@@ -792,11 +829,11 @@ function fmtAuditTime(ts: string): string {
               <tr v-if="!userPagination.paginated.value.length"><td colspan="8" class="empty-row">{{ t('common.noData') }}</td></tr>
             </tbody>
           </table>
-          <div class="table-pagination" v-if="userPagination.totalPages.value > 1">
+          <div class="table-pagination">
             <button class="page-btn" :disabled="userPagination.page.value <= 1" @click="userPagination.goPage(userPagination.page.value - 1)">‹ {{ t('common.prev') }}</button>
             <button v-for="p in userPagination.pageNumbers.value" :key="p" class="page-btn page-num" :class="{ active: p === userPagination.page.value }" @click="userPagination.goPage(p)">{{ p }}</button>
             <button class="page-btn" :disabled="userPagination.page.value >= userPagination.totalPages.value" @click="userPagination.goPage(userPagination.page.value + 1)">{{ t('common.next') }} ›</button>
-            <span class="page-info">{{ t('common.pageTotal', { n: userPagination.total.value }) }}</span>
+            <span class="page-info">{{ t('common.pageTotal', { n: userPagination.total.value, p: userPagination.totalPages.value }) }}</span>
           </div>
         </div>
       </div>
@@ -837,7 +874,7 @@ function fmtAuditTime(ts: string): string {
           </div>
           <table>
             <thead>
-              <tr><th>ID</th><th>{{ t('common.name') }}</th><th>{{ t('common.ip') }}</th><th>{{ t('admin.versionTag') }}</th><th>{{ t('common.token') }}</th><th>{{ t('common.status') }}</th><th>{{ t('common.mode') }}</th><th>{{ t('common.share') }}</th><th>{{ t('common.action') }}</th></tr>
+              <tr><th>ID</th><th>{{ t('common.name') }}</th><th>{{ t('common.ip') }}</th><th>{{ t('admin.versionTag') }}</th><th>{{ t('admin.deployMode') }}</th><th>{{ t('common.token') }}</th><th>{{ t('common.status') }}</th><th>{{ t('common.mode') }}</th><th>{{ t('common.share') }}</th><th>{{ t('common.action') }}</th></tr>
             </thead>
             <tbody>
               <tr v-for="a in agentPagination.paginated.value" :key="a.id">
@@ -849,8 +886,14 @@ function fmtAuditTime(ts: string): string {
                   <span v-else class="ver-badge muted">-</span>
                   <span v-if="a.needs_upgrade" class="upgrade-tip" :title="'最新版本 v' + (a.latest_version || '')">⚠️ {{ t('admin.canUpgrade') }}</span>
                 </td>
+                <td>
+                  <span v-if="a.deploy_mode === 'docker'" class="deploy-tag docker">🐳 Docker</span>
+                  <span v-else-if="a.deploy_mode === 'host'" class="deploy-tag host">🖥️ {{ t('admin.deployHost') }}</span>
+                  <span v-else class="deploy-tag unknown">-</span>
+                </td>
                 <td class="token-cell">
-                  <button class="token-btn" :title="t('common.copy')" @click="copyAgentToken(a.token)">📋</button>
+                  <button v-if="a.token" class="token-btn" :title="t('common.copy')" @click="copyAgentToken(a.token)">📋</button>
+                  <span v-else :title="t('admin.sharedReadonly')">-</span>
                 </td>
                 <td>
                   <span class="status-dot" :class="{ active: a.online }"></span>
@@ -864,29 +907,30 @@ function fmtAuditTime(ts: string): string {
                   <span v-else class="conn-tag pending">{{ t('common.pendingDetect') }}</span>
                 </td>
                 <td>
-                  <button class="share-tag" :class="a.shared_with === 'all' ? 'share-all' : a.shared_with === 'private' ? 'share-private' : 'share-select'" @click="openShareModal(a, 'agent')">
+                  <button v-if="a.is_owner" class="share-tag" :class="a.shared_with === 'all' ? 'share-all' : a.shared_with === 'private' ? 'share-private' : 'share-select'" @click="openShareModal(a, 'agent')">
                     {{ a.shared_with === 'all' ? '🌐' + t('common.allUsers') : a.shared_with === 'private' ? '🔒' + t('common.private') : '👥' + t('common.specified') }}
                   </button>
+                  <span v-else class="share-tag" :title="t('admin.sharedReadonly')">{{ t('admin.sharedFromTag') }}</span>
                 </td>
                 <td class="action-cell">
                   <div class="action-inner">
-                    <button v-if="a.needs_upgrade" class="text-btn success" @click="upgradeAgent(a.id)" style="color:#16a34a" :disabled="upgradingAgents.has(a.id)">{{ upgradingAgents.has(a.id) ? t('common.upgrading') : (t('admin.upgradeVersion') + a.latest_version) }}</button>
+                    <button v-if="a.needs_upgrade" class="text-btn success" :disabled="upgradingAgents.has(a.id) || !a.is_owner" :title="a.is_owner ? '' : t('admin.sharedReadonly')" @click="upgradeAgent(a.id)" style="color:#16a34a">{{ upgradingAgents.has(a.id) ? t('common.upgrading') : (t('admin.upgradeVersion') + a.latest_version) }}</button>
                     <button class="text-btn info" :disabled="!a.online || detectingAgents.has(a.id)" @click="detectOneAgent(a)">{{ detectingAgents.has(a.id) ? t('common.detecting') : t('admin.detectOne') }}</button>
                     <button class="text-btn" @click="openAgentConfig(a)">{{ t('sftp.config') }}</button>
-                    <button class="text-btn" :class="a.is_active ? 'warn' : 'success'" @click="toggleAgentStatus(a.id)">{{ a.is_active ? t('common.disabled') : t('common.enabled') }}</button>
-                    <button class="text-btn" @click="openDeployScript(a.id)">{{ t('ssh.deployScript') }}</button>
-                    <button class="text-btn danger" @click="openDeleteAgent(a)">{{ t('common.delete') }}</button>
+                    <button class="text-btn" :class="a.is_active ? 'warn' : 'success'" :disabled="!a.is_owner" :title="a.is_owner ? '' : t('admin.sharedReadonly')" @click="toggleAgentStatus(a.id)">{{ a.is_active ? t('common.disabled') : t('common.enabled') }}</button>
+                    <button class="text-btn" :disabled="!a.is_owner" :title="a.is_owner ? '' : t('admin.sharedReadonly')" @click="openDeployScript(a.id)">{{ t('ssh.deployScript') }}</button>
+                    <button class="text-btn danger" :disabled="!a.is_owner" :title="a.is_owner ? '' : t('admin.sharedReadonly')" @click="openDeleteAgent(a)">{{ t('common.delete') }}</button>
                   </div>
                 </td>
               </tr>
-              <tr v-if="!agentPagination.paginated.value.length"><td colspan="9" class="empty-row">{{ t('common.noData') }}</td></tr>
+              <tr v-if="!agentPagination.paginated.value.length"><td colspan="10" class="empty-row">{{ t('common.noData') }}</td></tr>
             </tbody>
           </table>
-          <div class="table-pagination" v-if="agentPagination.totalPages.value > 1">
+          <div class="table-pagination">
             <button class="page-btn" :disabled="agentPagination.page.value <= 1" @click="agentPagination.goPage(agentPagination.page.value - 1)">‹ {{ t('common.prev') }}</button>
             <button v-for="p in agentPagination.pageNumbers.value" :key="p" class="page-btn page-num" :class="{ active: p === agentPagination.page.value }" @click="agentPagination.goPage(p)">{{ p }}</button>
             <button class="page-btn" :disabled="agentPagination.page.value >= agentPagination.totalPages.value" @click="agentPagination.goPage(agentPagination.page.value + 1)">{{ t('common.next') }} ›</button>
-            <span class="page-info">{{ t('common.pageTotal', { n: agentPagination.total.value }) }}</span>
+            <span class="page-info">{{ t('common.pageTotal', { n: agentPagination.total.value, p: agentPagination.totalPages.value }) }}</span>
           </div>
         </div>
       </div>
@@ -922,26 +966,27 @@ function fmtAuditTime(ts: string): string {
                   {{ c.is_active ? t('common.enabled') : t('common.disabled') }}
                 </td>
                 <td>
-                  <button class="share-tag" :class="c.shared_with === 'all' ? 'share-all' : c.shared_with === 'private' ? 'share-private' : 'share-select'" @click="openShareModal(c, 'coturn')">
+                  <button v-if="c.is_owner" class="share-tag" :class="c.shared_with === 'all' ? 'share-all' : c.shared_with === 'private' ? 'share-private' : 'share-select'" @click="openShareModal(c, 'coturn')">
                     {{ c.shared_with === 'all' ? '🌐' + t('common.allUsers') : c.shared_with === 'private' ? '🔒' + t('common.private') : '👥' + t('common.specified') }}
                   </button>
+                  <span v-else class="share-tag" :title="t('admin.sharedReadonly')">{{ t('admin.sharedFromTag') }}</span>
                 </td>
                 <td class="action-cell">
                   <div class="action-inner">
-                    <button class="text-btn" @click="openEditCoturn(c)">{{ t('common.edit') }}</button>
-                    <button class="text-btn info" @click="testCoturn(c)">测试</button>
-                    <button class="text-btn danger" @click="openDeleteCoturn(c)">{{ t('common.delete') }}</button>
+                    <button class="text-btn" :disabled="!c.is_owner" :title="c.is_owner ? '' : t('admin.sharedReadonly')" @click="openEditCoturn(c)">{{ t('common.edit') }}</button>
+                    <button class="text-btn info" :disabled="!c.is_owner" :title="c.is_owner ? '' : t('admin.sharedReadonly')" @click="testCoturn(c)">测试</button>
+                    <button class="text-btn danger" :disabled="!c.is_owner" :title="c.is_owner ? '' : t('admin.sharedReadonly')" @click="openDeleteCoturn(c)">{{ t('common.delete') }}</button>
                   </div>
                 </td>
               </tr>
               <tr v-if="!coturnPagination.paginated.value.length"><td colspan="8" class="empty-row">{{ t('common.noData') }}</td></tr>
             </tbody>
           </table>
-          <div class="table-pagination" v-if="coturnPagination.totalPages.value > 1">
+          <div class="table-pagination">
             <button class="page-btn" :disabled="coturnPagination.page.value <= 1" @click="coturnPagination.goPage(coturnPagination.page.value - 1)">‹ {{ t('common.prev') }}</button>
             <button v-for="p in coturnPagination.pageNumbers.value" :key="p" class="page-btn page-num" :class="{ active: p === coturnPagination.page.value }" @click="coturnPagination.goPage(p)">{{ p }}</button>
             <button class="page-btn" :disabled="coturnPagination.page.value >= coturnPagination.totalPages.value" @click="coturnPagination.goPage(coturnPagination.page.value + 1)">{{ t('common.next') }} ›</button>
-            <span class="page-info">{{ t('common.pageTotal', { n: coturnPagination.total.value }) }}</span>
+            <span class="page-info">{{ t('common.pageTotal', { n: coturnPagination.total.value, p: coturnPagination.totalPages.value }) }}</span>
           </div>
         </div>
       </div>
@@ -996,11 +1041,11 @@ function fmtAuditTime(ts: string): string {
               <tr v-if="!auditPagination.paginated.value.length"><td colspan="6" class="empty-row">{{ t('admin.noLogs') }}</td></tr>
             </tbody>
           </table>
-          <div class="table-pagination" v-if="auditPagination.totalPages.value > 1">
+          <div class="table-pagination">
             <button class="page-btn" :disabled="auditPagination.page.value <= 1" @click="auditPagination.goPage(auditPagination.page.value - 1)">‹ {{ t('common.prev') }}</button>
             <button v-for="p in auditPagination.pageNumbers.value" :key="p" class="page-btn page-num" :class="{ active: p === auditPagination.page.value }" @click="auditPagination.goPage(p)">{{ p }}</button>
             <button class="page-btn" :disabled="auditPagination.page.value >= auditPagination.totalPages.value" @click="auditPagination.goPage(auditPagination.page.value + 1)">{{ t('common.next') }} ›</button>
-            <span class="page-info">{{ t('common.pageTotal', { n: auditPagination.total.value }) }}</span>
+            <span class="page-info">{{ t('common.pageTotal', { n: auditPagination.total.value, p: auditPagination.totalPages.value }) }}</span>
           </div>
         </div>
       </div>
@@ -1058,6 +1103,10 @@ function fmtAuditTime(ts: string): string {
                 <span class="download-platform">🐧 Linux (x86_64)</span>
                 <span class="download-btn">{{ t('admin.downloadBtn') }}</span>
               </a>
+              <a class="download-item" :href="`/api/deploy/wragent/linux-arm64`" download>
+                <span class="download-platform">🐧 Linux (ARM64)</span>
+                <span class="download-btn">{{ t('admin.downloadBtn') }}</span>
+              </a>
               <a class="download-item" :href="`/api/deploy/wragent/windows-amd64`" download>
                 <span class="download-platform">🪟 Windows (x86_64)</span>
                 <span class="download-btn">{{ t('admin.downloadBtn') }}</span>
@@ -1075,6 +1124,10 @@ function fmtAuditTime(ts: string): string {
             <div class="download-list">
               <a class="download-item" :href="`/api/deploy/wrgateway/linux-amd64`" download>
                 <span class="download-platform">🐧 Linux (x86_64)</span>
+                <span class="download-btn">{{ t('admin.downloadBtn') }}</span>
+              </a>
+              <a class="download-item" :href="`/api/deploy/wrgateway/linux-arm64`" download>
+                <span class="download-platform">🐧 Linux (ARM64)</span>
                 <span class="download-btn">{{ t('admin.downloadBtn') }}</span>
               </a>
               <a class="download-item" :href="`/api/deploy/wrgateway/windows-amd64`" download>
@@ -1439,6 +1492,7 @@ function fmtAuditTime(ts: string): string {
       :agent-id="configAgentId"
       :agent-name="configAgentName"
       :agent-online="configAgentOnline"
+      :readonly="configAgentReadonly"
       @close="closeAgentConfig"
       @updated="onAgentInfoUpdated"
       @token="onAgentToken"
@@ -1483,10 +1537,10 @@ function fmtAuditTime(ts: string): string {
 
 /* 分页 */
 .pagination { display: flex; align-items: center; justify-content: center; gap: 12px; padding: 12px 0 0; }
-.page-btn { min-width: 32px; height: 32px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel); color: var(--fg); font-size: 13px; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+.page-btn { padding: 4px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel); color: var(--fg); font-size: 13px; cursor: pointer; display: flex; align-items: center; justify-content: center; }
 .page-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
 .page-btn:disabled { opacity: .3; cursor: default; }
-.page-info { font-size: 13px; color: var(--muted); min-width: 60px; text-align: center; }
+.page-info { font-size: 13px; color: var(--muted); margin-left: 12px; }
 
 .role-badge { display: inline-block; padding: 2px 8px; border-radius: 4px; color: white; font-size: 13px; font-weight: 600; }
 .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #dc2626; margin-right: 4px; vertical-align: middle; }
@@ -1496,6 +1550,10 @@ function fmtAuditTime(ts: string): string {
 .action-badge { display: inline-block; padding: 2px 6px; border-radius: 3px; background: var(--panel-2); font-size: 13px; }
 
 
+.deploy-tag { display:inline-block; padding:2px 8px; border-radius:999px; font-size:11px; font-weight:600; white-space:nowrap; }
+.deploy-tag.docker { background:#e0f2fe; color:#0369a1; border:1px solid #bae6fd; }
+.deploy-tag.host { background:#dcfce7; color:#15803d; border:1px solid #bbf7d0; }
+.deploy-tag.unknown { background:#f3f4f6; color:#9ca3af; }
 .conn-tag { display:inline-block; padding:2px 8px; border-radius:4px; font-size:13px; font-weight:600; }
 .conn-tag.p2p { background:#d1fae5; color:#065f46; }
 .conn-tag.relay { background:#fef3c7; color:#92400e; }

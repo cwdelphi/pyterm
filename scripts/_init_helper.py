@@ -10,6 +10,8 @@ DB_CMD = 'docker exec pyterm_mariadb mariadb -u ppy -pchange_me_pass ppy_tools -
 
 def db(sql):
     r = subprocess.run(DB_CMD + ' "' + sql + '"', shell=True, capture_output=True, text=True)
+    if r.returncode != 0 and r.stderr.strip():
+        print(f"  [db-err] ...{r.stderr.strip()[-400:]}", file=sys.stderr)
     return r.stdout.strip()
 
 
@@ -221,4 +223,62 @@ elif cmd == "test-restore":
         print("  SSH connections match baseline")
     else:
         print(f"  SSH MISMATCH: current={set(cur2.keys())} baseline={set(bl_ssh.keys())}")
+    print("=== DONE ===")
+
+elif cmd == "test-clean-users":
+    # T0.7 环境债: 清理 pytest 遗留账号
+    # 这些账号由 app/tests 每轮运行创建(带时间戳后缀), 长期堆积会:
+    #   1) 污染用户列表/搜索;
+    #   2) 被 E2E 误当作真实属主(历史事故: inportb 删掉了 local-agent 导致 agent 永久失联)。
+    # admin 与 config-snapshot.json 登记的基线资源一律保留。
+    print("=== test-clean-users ===")
+    TEST_USER_RE = "^(integ|wrtc|speedtest|sshsftp|auth|normal|iso|test|temp)_"
+    _gc = "SET SESSION group_concat_max_len=1000000;"
+    ids = db(_gc + f" SELECT GROUP_CONCAT(id) FROM users "
+             f"WHERE username REGEXP '{TEST_USER_RE}' OR username IN ('inportb');")
+    if not ids:
+        print("  no leftover test users")
+        print("=== DONE ===")
+        sys.exit(0)
+    id_list = ",".join(f"'{i}'" for i in ids.split(","))
+    names = db(_gc + f" SELECT GROUP_CONCAT(username) FROM users WHERE id IN ({id_list});")
+    name_list = ",".join(f"'{n}'" for n in names.split(",")) if names else "''"
+    print(f"  leftover users: {len(ids.split(','))}  ({names[:120]}...)")
+
+    snap = load_snap() if os.path.exists(SNAPSHOT_FILE) else {}
+    keep_agents = {a["id"] for a in snap.get("agents", [])}
+    keep_gws = {g["id"] for g in snap.get("gateways", [])}
+    keep_ssh = set(snap.get("ssh_connections", {}).keys())
+
+    def not_in(col, keep):
+        if not keep:
+            return ""
+        kw = ",".join(f"'{k}'" for k in sorted(keep))
+        return f" AND {col} NOT IN ({kw})"
+
+    # FK: link_items -> link_groups -> users, 其余直接挂 users, 故先子后父
+    steps = [
+        ("link_items",   f"DELETE FROM link_items WHERE group_id IN (SELECT id FROM link_groups WHERE user_id IN ({id_list}))"),
+        ("link_groups",  f"DELETE FROM link_groups WHERE user_id IN ({id_list})"),
+        ("documents",    f"DELETE FROM documents WHERE user_id IN ({id_list})"),
+        ("ssh_keys",     f"DELETE FROM ssh_keys WHERE user_id IN ({id_list})"),
+        ("links",        f"DELETE FROM links WHERE user_id IN ({id_list})"),
+        ("sftp_configs", f"DELETE FROM sftp_configs WHERE user_id IN ({id_list})"),
+        ("connection_timeline", f"DELETE FROM connection_timeline WHERE user_id IN ({id_list})"),
+        ("agents",       f"DELETE FROM agents WHERE owner_id IN ({id_list}){not_in('id', keep_agents)}"),
+        ("gateways",     f"DELETE FROM gateways WHERE owner_id IN ({id_list}){not_in('id', keep_gws)}"),
+        ("ssh_connections", f"DELETE FROM ssh_connections WHERE user_id IN ({id_list}){not_in('id', keep_ssh)}"),
+        ("users",        f"DELETE FROM users WHERE id IN ({id_list})"),
+        ("login_attempts", f"DELETE FROM login_attempts WHERE username IN ({name_list})"),
+    ]
+    total = 0
+    for table, sql in steps:
+        r = db(sql + "; SELECT ROW_COUNT();")
+        last = (r.splitlines() or [""])[-1].strip()
+        n = int(last) if last.lstrip("-").isdigit() else 0
+        total += n
+        if n:
+            print(f"  {table}: -{n}")
+    print(f"  total rows deleted: {total}")
+    print("  audit_log 保留(历史留痕)")
     print("=== DONE ===")

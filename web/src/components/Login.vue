@@ -2,6 +2,7 @@
 import { ref, defineEmits } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { setLocale, getLocale } from '../i18n'
+import { reloadLogLevel } from '../utils/logger'
 
 const { t } = useI18n()
 const emit = defineEmits<{
@@ -57,6 +58,7 @@ async function handleLogin() {
     // 存储token
     localStorage.setItem('token', data.token)
     localStorage.setItem('user', JSON.stringify(data.user))
+    reloadLogLevel()  // 日志等级按账户隔离：登录后切到该账户的等级
 
     emit('login', data.token, data.user)
   } catch (e: any) {

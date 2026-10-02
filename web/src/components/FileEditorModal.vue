@@ -54,10 +54,6 @@ function decodeBase64Utf8(b64: string): string {
   return new TextDecoder('utf-8').decode(bytes)
 }
 
-function utf8ToB64(str: string): string {
-  return btoa(Array.from(new TextEncoder().encode(str), b => String.fromCharCode(b)).join(''))
-}
-
 /* ── Markdown insert helpers ── */
 function insertMd(view: EditorView, before: string, wrap = false) {
   const { from, to } = view.state.selection.main
@@ -203,7 +199,8 @@ async function loadFile() {
     } else {
       result = await api.sftpClientRead({ ...props.connParams, path: props.path })
     }
-    content.value = decodeBase64Utf8(result.content)
+    // T1.3: webrtc 路径 read 返回 raw bytes, 直连 TextDecoder; HTTP 兜底仍是 base64 串
+    content.value = props.webrtcManager ? new TextDecoder().decode(result.content) : decodeBase64Utf8(result.content)
     saved.value = true
     statusKind.value = 'saved'
     statusExtra.value = ''
@@ -226,7 +223,8 @@ async function saveFile() {
   statusKind.value = 'saving'
   try {
     if (props.webrtcManager) {
-      await props.webrtcManager.sendSftpRequest('write', { path: props.path, content: utf8ToB64(content.value) })
+      // T1.3: 二进制协议下 content 传 raw UTF-8 字节, 免 base64
+      await props.webrtcManager.sendSftpRequest('write', { path: props.path, content: new TextEncoder().encode(content.value) })
     } else {
       await api.sftpClientWrite({ ...props.connParams, path: props.path, content: content.value })
     }

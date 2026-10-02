@@ -36,11 +36,14 @@ const deleteTargetId = ref('')
 const deleteTargetName = ref('')
 const showPasswords = ref<Record<string, boolean>>({ password: false, vnc_password: false, rdp_password: false })
 function togglePassword(field: string) { showPasswords.value[field] = !showPasswords.value[field] }
-const agents = ref<{id: string; name: string; remark: string; is_active: number; online?: boolean}[]>([])
-const gateways = ref<{id: string; name: string; url: string; remark: string; is_active: number}[]>([])
+const agents = ref<{id: string; name: string; remark: string; is_active: number; online?: boolean; ip?: string; is_owner?: boolean; owner_name?: string}[]>([])
+const gateways = ref<{id: string; name: string; url: string; remark: string; is_active: number; is_owner?: boolean; owner_name?: string}[]>([])
+/* 控制台可见范围：仅自有 Agent（共享来的 Agent 不进「Agent 控制台」分组与测速目标；
+   仍保留在新建连接下拉中可选用）。!== false 防后端漏返 is_owner 时误隐藏自有 Agent。 */
+const consoleAgents = computed(() => agents.value.filter(a => a.is_owner !== false))
 
 /* ── 分组折叠状态 ── */
-const collapsedGroups = ref<Set<string>>(new Set(['ssh', 'vnc', 'rdp']))
+const collapsedGroups = ref<Set<string>>(new Set(['ssh', 'vnc', 'rdp', 'agents']))
 
 /* ── 过滤后的配置列表 ── */
 const filteredConns = computed(() => conns.value)
@@ -106,9 +109,11 @@ onMounted(async () => {
     const c = conns.value.find((c: any) => c.name === e.detail)
     if (c) openSshTab(c)
   }) as EventListener)
+  window.addEventListener('keydown', onStKeydown)
 })
 onBeforeUnmount(() => {
   tabs.value.forEach((t) => closeTerm(t.id))
+  window.removeEventListener('keydown', onStKeydown)
   if (stUnsub) { stUnsub(); stUnsub = null }
   stopStTimer()
 })
@@ -197,25 +202,37 @@ function openWebtermTab(agent: { id: string; name: string; online?: boolean }) {
   connectSshWithMode(conn)
 }
 
-/* ── 测速(Agent↔Agent P2P 独立DC, 阶段S) ── */
+/* ── 测速(Agent↔Agent P2P 独立DC, 阶段S · 对标主流测速 UX) ── */
 const showSpeedtest = ref(false)
 const stSrc = ref('')
 const stTarget = ref('')
 const stLimit = ref(10)
-const stPhase = ref<'idle' | 'running' | 'done' | 'error'>('idle')
-const stSub = ref('up')
+const stPhase = ref<'idle' | 'running' | 'done' | 'error' | 'cancelled'>('idle')
+const stSub = ref<'up' | 'down'>('up')
 const stMbps = ref(0)
 const stUp = ref(0)
 const stDown = ref(0)
+const stDuration = ref(0)
+const stPing = ref(0)
+const stJitter = ref(0)
+const stLoss = ref(0)
 const stError = ref('')
 const stRoom = ref('')
 const stHistory = ref<Array<{ source: string; target: string; up_mbps: number; down_mbps: number; duration: number; finished_at: number }>>([])
 const stPct = ref(0)
+const stUpSamples = ref<number[]>([])
+const stDownSamples = ref<number[]>([])
+const LIMITS = [10, 50, 100, 0]
 let stUnsub: (() => void) | null = null
 let stTimer: ReturnType<typeof setInterval> | null = null
+let stWatchdogT: ReturnType<typeof setTimeout> | null = null
 let stStartedAt = 0
 
-const stTargets = computed(() => agents.value.filter(a => a.online && a.id !== stSrc.value))
+function clearStWatchdog() { if (stWatchdogT) { clearTimeout(stWatchdogT); stWatchdogT = null } }
+
+const stTargets = computed(() => consoleAgents.value.filter(a => a.online && a.id !== stSrc.value))
+
+const stMaxRate = computed(() => Math.max(1, stUp.value, stDown.value, ...stUpSamples.value, ...stDownSamples.value))
 
 function stopStTimer() { if (stTimer) { clearInterval(stTimer); stTimer = null } }
 function agentNameOf(id: string) { return agents.value.find(a => a.id === id)?.name || id }
@@ -226,12 +243,50 @@ function fmtStTime(ts: number) {
   return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
+// 当前阶段实时采样 → SVG 折线点
+function sparkPoints(samples: number[], max: number): string {
+  const n = samples.length
+  if (n === 0) return ''
+  const w = 600, h = 80, pad = 2
+  return samples.map((v, i) => {
+    const x = (i / (samples.length - 1)) * w
+    const y = h - pad - (v / max) * (h - pad * 2)
+    return `${x.toFixed(1)},${y.toFixed(1)}`
+  }).join(' ')
+}
+
+// 链路一致性评分: 100 - CV*100 (速率波动越小越稳; 修剪两端10%抗离群点)
+function consistency(samples: number[]): number {
+  const vals = samples.filter(v => v > 0).sort((a, b) => a - b)
+  if (vals.length < 2) return 0
+  const cut = Math.max(0, Math.floor(vals.length * 0.1))
+  const core = vals.slice(cut, vals.length - cut)
+  if (core.length < 2) return 0
+  const mean = core.reduce((a, b) => a + b, 0) / core.length
+  const sd = Math.sqrt(core.reduce((a, b) => a + (b - mean) ** 2, 0) / core.length)
+  const cv = mean > 0 ? sd / mean : 1
+  return Math.max(0, Math.min(100, Math.round(100 * (1 - cv))))
+}
+const stGrade = computed(() => {
+  const c = consistency([...stUpSamples.value, ...stDownSamples.value])
+  return c >= 85 ? 4 : c >= 70 ? 3 : c >= 50 ? 2 : 1
+})
+const gradeLabel = computed(() =>
+  stGrade.value === 4 ? t('ssh.stGradeExcellent') : stGrade.value === 3 ? t('ssh.stGradeGood') : stGrade.value === 2 ? t('ssh.stGradeFair') : t('ssh.stGradePoor')
+)
+const gradeColor = computed(() =>
+  stGrade.value === 4 ? 'excellent' : stGrade.value === 3 ? 'good' : stGrade.value === 2 ? 'fair' : 'poor'
+)
+
 function openSpeedtest(a: { id: string; name: string; online?: boolean }) {
   if (!a.online) { toast?.error(t('ssh.agentOffline')); return }
   stSrc.value = a.id
-  stTarget.value = agents.value.find(x => x.online && x.id !== a.id)?.id || ''
+  stTarget.value = consoleAgents.value.find(x => x.online && x.id !== a.id)?.id || ''
   stPhase.value = 'idle'; stError.value = ''; stRoom.value = ''
-  stPct.value = 0; stMbps.value = 0
+  stPct.value = 0; stMbps.value = 0; stDuration.value = 0
+  stPing.value = 0; stJitter.value = 0; stLoss.value = 0
+  clearStWatchdog()
+  stUpSamples.value = []; stDownSamples.value = []
   showSpeedtest.value = true
   if (!stUnsub) stUnsub = speedtestSubscribe(onSpeedtestMsg)
   loadSpeedtestHistory()
@@ -241,11 +296,17 @@ function closeSpeedtest() {
   if (stPhase.value === 'running' && stRoom.value) speedtestSend({ type: 'speedtest_cancel', room_id: stRoom.value })
   if (stUnsub) { stUnsub(); stUnsub = null }
   stopStTimer()
+  clearStWatchdog()
   showSpeedtest.value = false
 }
 
+// ESC 关闭测速弹层(运行中 = 直接中止并关闭)
+function onStKeydown(e: KeyboardEvent) {
+  if (e.key === 'Escape' && showSpeedtest.value) closeSpeedtest()
+}
+
 async function loadSpeedtestHistory() {
-  try { const d = await api.speedtestHistory(); stHistory.value = d.history || [] } catch {}
+  try { const d = await api.speedtestHistory(); stHistory.value = (d.history || []).slice(0, 5) } catch {}
 }
 
 function startSpeedtest() {
@@ -254,10 +315,32 @@ function startSpeedtest() {
   if (!token) { toast?.error(t('ssh.notLoggedIn')); return }
   stPhase.value = 'running'; stSub.value = 'up'; stError.value = ''
   stUp.value = 0; stDown.value = 0; stPct.value = 0; stRoom.value = ''
-  stMbps.value = 0
+  stMbps.value = 0; stDuration.value = 0
+  stPing.value = 0; stJitter.value = 0; stLoss.value = 0
+  stUpSamples.value = []; stDownSamples.value = []
   stStartedAt = Date.now()
   stopStTimer()
   stTimer = setInterval(() => { stPct.value = Math.min(99, ((Date.now() - stStartedAt) / 20000) * 100) }, 400)
+  // B2 看门狗: 2×10s + 6s 内无 result 即自动收尾(先在历史中找回结果, 否则报超时)
+  clearStWatchdog()
+  stWatchdogT = setTimeout(() => {
+    if (stPhase.value !== 'running') return
+    if (stRoom.value) speedtestSend({ type: 'speedtest_cancel', room_id: stRoom.value })
+    setTimeout(() => {
+      if (stPhase.value !== 'running') return
+      api.speedtestHistory().then((r: any) => {
+        const h = (r.history || []).find((x: any) =>
+          x.source === stSrc.value && x.target === stTarget.value && x.finished_at && x.finished_at * 1000 >= stStartedAt - 5000)
+        if (h) {
+          stUp.value = Number(h.up_mbps || 0); stDown.value = Number(h.down_mbps || 0)
+          stDuration.value = Number(h.duration || 0)
+          stPhase.value = 'done'; stPct.value = 100; stopStTimer(); loadSpeedtestHistory()
+        } else {
+          stPhase.value = 'error'; stError.value = t('ssh.stTimeout'); stRoom.value = ''; stopStTimer()
+        }
+      }).catch(() => { stPhase.value = 'error'; stError.value = t('ssh.stTimeout'); stRoom.value = ''; stopStTimer() })
+    }, 2000)
+  }, 26000)
   const payload = { type: 'speedtest_start', source: stSrc.value, target: stTarget.value, mbps_limit: stLimit.value, token }
   // 信令 ws 可能仍在连接中(弹层刚打开即点开始): 发送失败退避重试一次
   if (!speedtestSend(payload)) {
@@ -275,6 +358,26 @@ function cancelSpeedtest() {
   if (stRoom.value) speedtestSend({ type: 'speedtest_cancel', room_id: stRoom.value })
 }
 
+function retest() {
+  if (stTarget.value) startSpeedtest()
+}
+
+function testAnother() {
+  const next = stTargets.value.find(a => a.id !== stTarget.value) || stTargets.value[0]
+  if (next) stTarget.value = next.id
+  stPhase.value = 'idle'
+}
+
+function retestHistory(h: { source: string; target: string }) {
+  const src = agents.value.find(a => a.id === h.source)
+  if (!src?.online) { toast?.error(t('ssh.agentOffline')); return }
+  stSrc.value = h.source
+  stTarget.value = h.target
+  stPhase.value = 'idle'
+  stRoom.value = ''
+  startSpeedtest()
+}
+
 function onSpeedtestMsg(msg: any) {
   if (!showSpeedtest.value) return
   switch (msg.type) {
@@ -282,18 +385,29 @@ function onSpeedtestMsg(msg: any) {
       stRoom.value = msg.room_id || ''
       stPhase.value = 'running'
       break
-    case 'speedtest_progress':
-      if (stRoom.value && msg.room_id && msg.room_id !== stRoom.value) return
-      stSub.value = msg.phase || 'up'
-      stMbps.value = msg.mbps || 0
+    case 'speedtest_ping':
+      stPing.value = Number(msg.ping_ms || 0)
+      stJitter.value = Number(msg.jitter_ms || 0)
+      stLoss.value = Number(msg.loss_pct || 0)
       break
+    case 'speedtest_progress': {
+      if (stRoom.value && msg.room_id && msg.room_id !== stRoom.value) return
+      const ph = msg.phase === 'down' ? 'down' : 'up'
+      stSub.value = ph
+      stMbps.value = msg.mbps || 0
+      if (ph === 'down') stDownSamples.value = [...stDownSamples.value, stMbps.value].slice(-60)
+      else stUpSamples.value = [...stUpSamples.value, stMbps.value].slice(-60)
+      break
+    }
     case 'speedtest_result':
       if (stRoom.value && msg.room_id && msg.room_id !== stRoom.value) return
       stUp.value = msg.up_mbps || 0
       stDown.value = msg.down_mbps || 0
+      stDuration.value = msg.duration || 0
       stPhase.value = 'done'
       stPct.value = 100
       stopStTimer()
+      clearStWatchdog()
       loadSpeedtestHistory()
       break
     case 'speedtest_error':
@@ -301,10 +415,17 @@ function onSpeedtestMsg(msg: any) {
       stError.value = msg.detail || t('ssh.stError')
       stRoom.value = ''
       stopStTimer()
+      clearStWatchdog()
       break
     case 'speedtest_cancelled':
+      stPhase.value = 'cancelled'
+      stRoom.value = ''
+      stopStTimer()
+      clearStWatchdog()
+      break
     case 'speedtest_stop':
       if (stPhase.value === 'running') { stPhase.value = 'idle'; stRoom.value = ''; stopStTimer() }
+      clearStWatchdog()
       break
   }
 }
@@ -579,10 +700,10 @@ function typeLabel(t: string) {
         <div class="conn-group agent-group">
           <div class="group-header" @click="toggleGroup('agents')">
             <span class="group-arrow" :class="{ expanded: !collapsedGroups.has('agents') }">▸</span>
-            <span class="group-label">{{ t('ssh.agentGroup') }} ({{ agents.length }})</span>
+            <span class="group-label">{{ t('ssh.agentGroup') }} ({{ consoleAgents.length }})</span>
           </div>
           <div v-if="!collapsedGroups.has('agents')" class="group-items">
-            <div v-for="a in agents" :key="a.id" class="agent-card"
+            <div v-for="a in consoleAgents" :key="a.id" class="agent-card"
                  :class="{ offline: !a.online }"
                  :title="a.online ? t('ssh.webterm') : t('ssh.agentOffline')"
                  @click="openWebtermTab(a)">
@@ -591,7 +712,7 @@ function typeLabel(t: string) {
               <span v-if="a.remark" class="agent-card-remark">{{ a.remark }}</span>
               <button v-if="a.online" class="st-btn" :title="t('ssh.speedtest')" @click.stop="openSpeedtest(a)">⚡</button>
             </div>
-            <EmptyState v-if="!agents.length" icon="🤖" :title="t('ssh.noAgents')" />
+            <EmptyState v-if="!consoleAgents.length" icon="🤖" :title="t('ssh.noAgents')" />
           </div>
         </div>
         <div v-if="groupedConns.ssh.length || !collapsedGroups.has('ssh')" class="conn-group">
@@ -894,13 +1015,13 @@ function typeLabel(t: string) {
               <div class="form-field form-field-agent"><label>Agent</label>
                 <select v-model="form.agent_id" class="form-select">
                   <option value="">{{ t('ssh.selectAgent') }}</option>
-                  <option v-for="a in agents" :key="a.id" :value="a.id">{{ a.name }}{{ a.remark ? ' (' + a.remark + ')' : '' }}</option>
+                  <option v-for="a in agents" :key="a.id" :value="a.id">{{ a.name }}{{ a.remark ? ' (' + a.remark + ')' : '' }}{{ a.is_owner === false && a.owner_name ? ' · ' + t('admin.fromOwner') + ' ' + a.owner_name : '' }}</option>
                 </select>
               </div>
               <div class="form-field form-field-agent"><label>{{ t('ssh.gatewayOptional') }}</label>
                 <select v-model="form.gateway_id" class="form-select">
                   <option value="">{{ t('ssh.noGateway') }}</option>
-                  <option v-for="g in gateways" :key="g.id" :value="g.id">{{ g.name }}{{ g.remark ? ' (' + g.remark + ')' : '' }}</option>
+                  <option v-for="g in gateways" :key="g.id" :value="g.id">{{ g.name }}{{ g.remark ? ' (' + g.remark + ')' : '' }}{{ g.is_owner === false && g.owner_name ? ' · ' + t('admin.fromOwner') + ' ' + g.owner_name : '' }}</option>
                 </select>
               </div>
             </div>
@@ -918,69 +1039,134 @@ function typeLabel(t: string) {
       </div>
     </Teleport>
 
-    <!-- 测速弹层(Agent↔Agent P2P 独立DC, 阶段S) -->
+    <!-- 测速弹层(Agent↔Agent P2P 独立DC, 阶段S · 对标主流测速 UX) -->
     <Teleport to="body">
       <div v-if="showSpeedtest" class="modal-mask" @click.self="closeSpeedtest()">
         <div class="modal-box st-box">
-          <h3>{{ t('ssh.speedtest') }}<span class="st-src-name">{{ agentNameOf(stSrc) }}</span></h3>
-          <div class="st-controls">
-            <div class="st-field">
-              <label>{{ t('ssh.stTarget') }}</label>
-              <select v-model="stTarget" :disabled="stPhase === 'running'">
-                <option v-if="!stTargets.length" value="">{{ t('ssh.stNoTarget') }}</option>
-                <option v-for="a in stTargets" :key="a.id" :value="a.id">{{ a.name }}</option>
-              </select>
-            </div>
-            <div class="st-field">
-              <label>{{ t('ssh.stLimit') }}</label>
-              <select v-model.number="stLimit" :disabled="stPhase === 'running'">
-                <option :value="10">10 Mbps</option>
-                <option :value="50">50 Mbps</option>
-                <option :value="100">100 Mbps</option>
-                <option :value="0">{{ t('ssh.stUnlimited') }}</option>
-              </select>
-            </div>
-            <button v-if="stPhase !== 'running'" class="btn primary" :disabled="!stTarget" @click="startSpeedtest">{{ t('ssh.stStart') }}</button>
-            <button v-else class="btn danger" @click="cancelSpeedtest">{{ t('ssh.stCancel') }}</button>
+          <div class="st-head">
+            <h3>⚡ {{ t('ssh.speedtest') }}<span class="st-src-name">{{ agentNameOf(stSrc) }}</span></h3>
+            <button class="st-close" type="button" :title="t('ssh.stClose')" @click="closeSpeedtest()">✕</button>
           </div>
-          <div class="st-stage" :class="stPhase">
-            <template v-if="stPhase === 'running'">
-              <div class="st-bar"><div class="st-bar-fill" :style="{ width: stPct + '%' }"></div></div>
-              <div class="st-live">{{ stSub === 'down' ? t('ssh.stDown') : t('ssh.stUp') }} <b>{{ stMbps.toFixed(1) }}</b> Mbps</div>
-            </template>
-            <div v-else-if="stPhase === 'error'" class="st-err">⚡ {{ stError }}</div>
-            <div v-else-if="stPhase === 'done'" class="st-result">
-              <div class="st-res-card">
-                <span class="st-res-label">↑ {{ t('ssh.stUp') }}</span>
-                <span class="st-res-val">{{ stUp.toFixed(1) }}</span>
-                <span class="st-res-unit">Mbps</span>
+
+          <div class="st-body">
+            <!-- 左栏: 配置 + 主按钮 + 最近测速 -->
+            <div class="st-left">
+              <div class="st-cfg">
+                <div class="st-cfg-label">{{ t('ssh.stTargets') }}</div>
+                <div class="st-targets">
+                  <button
+                    v-for="a in stTargets"
+                    :key="a.id"
+                    class="st-target" :class="{ active: a.id === stTarget }"
+                    :disabled="stPhase === 'running'"
+                    @click="stTarget = a.id"
+                  >
+                    <span class="si-dot online"></span>
+                    <span class="st-target-name">{{ a.name }}</span>
+                    <span v-if="a.ip" class="st-target-ip">{{ a.ip }}</span>
+                  </button>
+                  <div v-if="!stTargets.length" class="st-no-target">{{ t('ssh.stNoTarget') }}</div>
+                </div>
+                <div class="st-cfg-label st-cfg-gap">{{ t('ssh.stLimit') }}</div>
+                <div class="st-limits">
+                  <button
+                    v-for="l in LIMITS"
+                    :key="l"
+                    class="st-limit" :class="{ active: stLimit === l }"
+                    :disabled="stPhase === 'running'"
+                    @click="stLimit = l"
+                  >{{ l === 0 ? t('ssh.stUnlimited') : l + ' Mbps' }}</button>
+                  <span class="st-hint">{{ t('ssh.stPhaseHint') }}</span>
+                </div>
               </div>
-              <div class="st-res-card">
-                <span class="st-res-label">↓ {{ t('ssh.stDown') }}</span>
-                <span class="st-res-val">{{ stDown.toFixed(1) }}</span>
-                <span class="st-res-unit">Mbps</span>
+
+              <div class="st-main-btn">
+                <button v-if="stPhase !== 'running'" class="btn primary st-go" :disabled="!stTarget" @click="startSpeedtest">{{ t('ssh.stStart') }}</button>
+                <button v-else class="btn danger st-go" @click="cancelSpeedtest">{{ t('ssh.stCancel') }}</button>
+              </div>
+
+              <div class="st-history">
+                <div class="st-hist-title">{{ t('ssh.stHistory') }}</div>
+                <div class="st-hist-list">
+                  <template v-if="stHistory.length">
+                    <div v-for="(h, i) in stHistory" :key="i" class="st-hist-card">
+                      <div class="st-hist-main">
+                        <span class="st-hist-names">{{ agentNameOf(h.source) }} → {{ agentNameOf(h.target) }}</span>
+                        <span class="st-hist-time">{{ fmtStTime(h.finished_at) }}</span>
+                      <span v-if="Number(h.ping_ms || 0) > 0" class="st-hist-ping">{{ t('ssh.stPing') }} {{ Number(h.ping_ms).toFixed(1) }}ms</span>
+                      </div>
+                      <div class="st-hist-bars">
+                        <span class="st-hist-bar up"><i :style="{ width: (Number(h.up_mbps || 0) / Math.max(Number(h.up_mbps || 0), Number(h.down_mbps || 0), 1) * 100).toFixed(0) + '%' }"></i><em>↑ {{ Number(h.up_mbps || 0).toFixed(1) }}</em></span>
+                        <span class="st-hist-bar down"><i :style="{ width: (Number(h.down_mbps || 0) / Math.max(Number(h.up_mbps || 0), Number(h.down_mbps || 0), 1) * 100).toFixed(0) + '%' }"></i><em>↓ {{ Number(h.down_mbps || 0).toFixed(1) }}</em></span>
+                      </div>
+                      <button class="text-btn sm" @click="retestHistory(h)">{{ t('ssh.stRetest') }}</button>
+                    </div>
+                  </template>
+                  <EmptyState v-else icon="⚡" :title="t('ssh.stEmpty')" />
+                </div>
               </div>
             </div>
-            <div v-else class="st-idle">{{ t('ssh.stReady') }}</div>
-          </div>
-          <div class="st-history">
-            <div class="st-hist-title">{{ t('ssh.stHistory') }}</div>
-            <div class="st-hist-list">
-              <table v-if="stHistory.length" class="st-table">
-                <thead>
-                  <tr><th>{{ t('ssh.stSrc') }}</th><th>{{ t('ssh.stTarget') }}</th><th>↑ {{ t('ssh.stUp') }}</th><th>↓ {{ t('ssh.stDown') }}</th><th>{{ t('ssh.stTime') }}</th></tr>
-                </thead>
-                <tbody>
-                  <tr v-for="(h, i) in stHistory" :key="i">
-                    <td :title="h.source">{{ agentNameOf(h.source) }}</td>
-                    <td :title="h.target">{{ agentNameOf(h.target) }}</td>
-                    <td>{{ Number(h.up_mbps || 0).toFixed(1) }}</td>
-                    <td>{{ Number(h.down_mbps || 0).toFixed(1) }}</td>
-                    <td>{{ fmtStTime(h.finished_at) }}</td>
-                  </tr>
-                </tbody>
-              </table>
-              <EmptyState v-else icon="⚡" :title="t('ssh.stEmpty')" />
+
+            <!-- 右栏: 测速主区 -->
+            <div class="st-right">
+              <div class="st-stage" :class="stPhase">
+                <template v-if="stPhase === 'running'">
+                  <div class="st-gauge-row">
+                    <div class="st-gauge">
+                      <div class="st-big">{{ stMbps.toFixed(1) }}</div>
+                      <div class="st-big-unit">Mbps</div>
+                    </div>
+                    <svg class="st-spark" viewBox="0 0 600 80" preserveAspectRatio="none">
+                      <polyline
+                        v-if="(stSub === 'down' ? stDownSamples : stUpSamples).length"
+                        :points="sparkPoints(stSub === 'down' ? stDownSamples : stUpSamples, Math.max(stMaxRate, stMbps))"
+                        fill="none" stroke="currentColor" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"
+                      />
+                    </svg>
+                  </div>
+                  <div class="st-stage-meta">
+                    <span class="st-phase" :class="stSub">{{ stSub === 'down' ? t('ssh.stPhaseDown') : t('ssh.stPhaseUp') }}</span>
+                    <span class="st-phase-pct">{{ stPct.toFixed(0) }}%</span>
+                  </div>
+                  <div class="st-bar"><div class="st-bar-fill" :style="{ width: stPct + '%' }"></div></div>
+                </template>
+
+                <div v-else-if="stPhase === 'done'" class="st-result">
+                  <div class="st-res-card">
+                    <span class="st-res-label">↑ {{ t('ssh.stUp') }}</span>
+                    <span class="st-res-val">{{ stUp.toFixed(1) }}</span>
+                    <span class="st-res-unit">Mbps</span>
+                    <span class="st-res-bar"><i :style="{ width: Math.max(2, stUp / stMaxRate * 100).toFixed(0) + '%' }"></i></span>
+                  </div>
+                  <div class="st-res-card">
+                    <span class="st-res-label">↓ {{ t('ssh.stDown') }}</span>
+                    <span class="st-res-val">{{ stDown.toFixed(1) }}</span>
+                    <span class="st-res-unit">Mbps</span>
+                    <span class="st-res-bar"><i :style="{ width: Math.max(2, stDown / stMaxRate * 100).toFixed(0) + '%' }"></i></span>
+                  </div>
+                  <div class="st-grade" :class="gradeColor">
+                    <span class="st-grade-badge">{{ gradeLabel }}</span>
+                    <span class="st-grade-sub">{{ t('ssh.stConsistency') }} {{ consistency([...stUpSamples, ...stDownSamples]) }}%</span>
+                    <span class="st-grade-meta">{{ t('ssh.stSamples') }} {{ stUpSamples.length + stDownSamples.length }} · {{ t('ssh.stDuration') }} {{ stDuration }}s · {{ t('ssh.stLimit') }} {{ stLimit === 0 ? t('ssh.stUnlimited') : stLimit + 'Mbps' }}</span>
+                <span class="st-grade-ping">
+                  <em v-if="stPing > 0">PING {{ stPing.toFixed(1) }}ms</em><em v-if="stJitter > 0">· {{ t('ssh.stJitter') }} {{ stJitter.toFixed(1) }}ms</em><em v-if="stLoss > 0">· {{ t('ssh.stLoss') }} {{ stLoss.toFixed(1) }}%</em>
+                </span>
+                  </div>
+                  <div class="st-actions">
+                    <button class="btn primary" @click="retest()">🔄 {{ t('ssh.stRetest') }}</button>
+                    <button class="btn" @click="testAnother()">🎯 {{ t('ssh.stTestOther') }}</button>
+                  </div>
+                </div>
+
+                <div v-else-if="stPhase === 'error'" class="st-err">
+                  <div>⚡ {{ stError }}</div>
+                  <button class="btn" @click="stPhase = 'idle'">{{ t('ssh.stRetry') }}</button>
+                </div>
+
+                <div v-else-if="stPhase === 'cancelled'" class="st-idle">{{ t('ssh.stCancelled') }}</div>
+
+                <div v-else class="st-idle">{{ t('ssh.stReady') }}</div>
+              </div>
             </div>
           </div>
         </div>
@@ -1034,33 +1220,82 @@ function typeLabel(t: string) {
 .agent-group :deep(.empty-title) { font-size:12px; }
 .st-btn { flex-shrink:0; border:1px solid var(--border); background:var(--panel); border-radius:6px; font-size:11px; padding:2px 6px; cursor:pointer; line-height:1.4; color:var(--fg-2); }
 .st-btn:hover { border-color:var(--accent, #2563eb); color:var(--fg); }
-.st-box { width:560px; display:flex; flex-direction:column; gap:12px; }
-.st-src-name { font-size:13px; color:var(--muted); margin-left:8px; font-weight:400; }
-.st-controls { display:flex; gap:8px; align-items:flex-end; flex-wrap:wrap; }
-.st-controls .btn { height:34px; padding:0 14px; }
-.st-field { display:flex; flex-direction:column; gap:4px; flex:1; min-width:150px; }
-.st-field label { font-size:12px; color:var(--muted); }
-.st-field select { padding:6px 8px; border:1px solid var(--border); border-radius:6px; background:var(--panel-2); color:var(--fg); font-size:13px; }
-.st-stage { min-height:72px; display:flex; flex-direction:column; justify-content:center; gap:8px; padding:10px 12px; border:1px dashed var(--border); border-radius:8px; }
-.st-stage.running { border-style:solid; border-color:var(--accent, #2563eb); }
-.st-bar { height:8px; background:var(--panel-2); border-radius:4px; overflow:hidden; }
-.st-bar-fill { height:100%; background:var(--accent, #2563eb); transition:width .4s; }
-.st-live { font-size:13px; color:var(--fg-2); text-align:center; }
-.st-live b { color:var(--fg); font-size:15px; }
-.st-result { display:flex; gap:12px; }
-.st-res-card { flex:1; display:flex; flex-direction:column; align-items:center; gap:2px; padding:8px; background:var(--panel-2); border-radius:8px; }
+.modal-box.st-box { width:720px; max-width:92vw; max-height:88vh; overflow:hidden; padding:20px 24px; display:flex; flex-direction:column; gap:14px; }
+.st-head { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-shrink:0; }
+.st-box .st-head h3 { margin:0; font-size:17px; display:flex; align-items:center; gap:8px; min-width:0; overflow:hidden; }
+.st-src-name { font-size:12px; color:var(--fg-2); background:var(--panel-2); border:1px solid var(--border); border-radius:999px; padding:2px 10px; font-weight:400; max-width:320px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.st-close { width:32px; height:32px; flex-shrink:0; border:none; background:transparent; color:var(--muted); font-size:16px; line-height:1; border-radius:8px; cursor:pointer; display:inline-flex; align-items:center; justify-content:center; transition:background .15s, color .15s; }
+.st-close:hover { background:var(--panel-2); color:var(--fg); }
+.st-body { display:flex; align-items:stretch; gap:14px; flex:1; min-height:0; }
+.st-left { width:300px; flex-shrink:0; display:flex; flex-direction:column; gap:10px; min-height:0; overflow:hidden; }
+.st-right { flex:1; min-width:0; display:flex; flex-direction:column; min-height:0; }
+.st-cfg { flex-shrink:0; }
+.st-cfg-label { font-size:12px; color:var(--muted); margin-bottom:6px; }
+.st-targets { display:flex; gap:8px; flex-wrap:wrap; }
+.st-target { display:inline-flex; align-items:center; gap:5px; padding:4px 9px; border:1px solid var(--border); border-radius:8px; background:var(--panel); color:var(--fg); font-size:13px; cursor:pointer; transition:border-color .15s, box-shadow .15s, background .15s; }
+.st-target:hover { border-color:var(--accent, #2563eb); }
+.st-target.active { border-color:var(--accent, #2563eb); background:var(--accent-soft); box-shadow:0 0 0 2px rgba(37,99,235,.15); }
+.st-target:disabled { opacity:.55; cursor:not-allowed; }
+.st-target-name { font-weight:600; }
+.st-target-ip { font-size:10px; color:var(--muted); }
+.st-no-target { font-size:13px; color:var(--muted); padding:4px 2px; }
+.st-limits { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+.st-limit { padding:4px 12px; border:1px solid var(--border); border-radius:999px; background:var(--panel); color:var(--fg-2); font-size:12px; cursor:pointer; transition:all .15s; }
+.st-limit:hover { border-color:var(--accent, #2563eb); color:var(--fg); }
+.st-limit.active { background:var(--accent, #2563eb); border-color:var(--accent, #2563eb); color:#fff; }
+.st-limit:disabled { opacity:.55; cursor:not-allowed; }
+.st-hint { font-size:11px; color:var(--muted); margin-left:4px; }
+.st-stage { flex-shrink:0; min-height:160px; display:flex; flex-direction:column; justify-content:center; gap:10px; padding:18px 20px; background:var(--panel-2); border:1px solid var(--border); border-radius:12px; }
+.st-stage.running { border-color:var(--accent, #2563eb); background:var(--accent-soft); }
+.st-stage.error { border-color:#ef4444; }
+.st-gauge { display:flex; align-items:baseline; justify-content:center; gap:6px; }
+.st-big { font-size:54px; font-weight:700; color:var(--fg); line-height:1; letter-spacing:-1px; }
+.st-big-unit { font-size:14px; color:var(--muted); }
+.st-spark { width:100%; height:56px; color:var(--accent, #2563eb); overflow:visible; }
+.st-stage-meta { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+.st-phase { font-size:13px; font-weight:600; padding:2px 10px; border-radius:999px; }
+.st-phase.up { background:#dbeafe; color:#2563eb; }
+.st-phase.down { background:#dcfce7; color:#16a34a; }
+.st-phase-pct { font-size:12px; color:var(--muted); }
+.st-bar { height:8px; background:var(--panel); border-radius:4px; overflow:hidden; }
+.st-bar-fill { height:100%; background:linear-gradient(90deg, var(--accent, #2563eb), #16a34a); transition:width .4s; }
+.st-result { display:flex; gap:16px; align-items:stretch; flex-wrap:wrap; }
+.st-res-card { flex:1; min-width:150px; display:flex; flex-direction:column; align-items:center; gap:4px; padding:6px 8px; }
 .st-res-label { font-size:12px; color:var(--muted); }
-.st-res-val { font-size:22px; font-weight:600; color:var(--fg); line-height:1.2; }
+.st-res-val { font-size:36px; font-weight:700; color:var(--fg); line-height:1.1; }
 .st-res-unit { font-size:11px; color:var(--muted); }
-.st-err { color:#ef4444; font-size:13px; text-align:center; }
+.st-res-bar { width:100%; height:8px; background:var(--panel); border-radius:4px; overflow:hidden; }
+.st-res-bar i { display:block; height:100%; background:linear-gradient(90deg, #2563eb, #16a34a); border-radius:4px; transition:width .4s; }
+.st-grade { flex:1 1 100%; display:flex; flex-direction:column; align-items:center; gap:2px; padding:8px 12px; border-radius:8px; }
+.st-grade-badge { font-size:15px; font-weight:700; }
+.st-grade-sub { font-size:12px; color:var(--fg-2); }
+.st-grade-meta { font-size:11px; color:var(--muted); }
+.st-grade-ping { display:flex; gap:8px; font-size:11px; }
+.st-grade-ping em { font-style:normal; }
+.st-hist-ping { font-size:10px; color:var(--muted); white-space:nowrap; }
+.st-grade.excellent { background:#dcfce7; color:#15803d; }
+.st-grade.good { background:#cffafe; color:#0e7490; }
+.st-grade.fair { background:#fed7aa; color:#c2410c; }
+.st-grade.poor { background:#fee2e2; color:#b91c1c; }
+.st-actions { display:flex; gap:8px; justify-content:center; }
+.st-err { display:flex; flex-direction:column; align-items:center; gap:10px; color:#ef4444; font-size:13px; text-align:center; }
 .st-idle { font-size:13px; color:var(--muted); text-align:center; }
-.st-history { flex:1; min-height:120px; display:flex; flex-direction:column; gap:6px; }
-.st-hist-title { font-size:12px; color:var(--muted); }
-.st-hist-list { flex:1; min-height:100px; max-height:220px; overflow:auto; border:1px solid var(--border); border-radius:8px; }
-.st-table { width:100%; border-collapse:collapse; font-size:12px; }
-.st-table th, .st-table td { padding:6px 8px; text-align:left; border-bottom:1px solid var(--border); white-space:nowrap; }
-.st-table th { color:var(--muted); font-weight:500; position:sticky; top:0; background:var(--panel); z-index:1; }
-.st-table td { color:var(--fg-2); max-width:130px; overflow:hidden; text-overflow:ellipsis; }
+.st-main-btn { display:flex; justify-content:center; flex-shrink:0; }
+.st-go { min-width:200px; height:40px; font-size:14px; font-weight:600; border-radius:8px; }
+.st-history { flex:1; min-height:0; display:flex; flex-direction:column; gap:6px; overflow:hidden; }
+.st-hist-title { font-size:12px; color:var(--muted); flex-shrink:0; }
+.st-hist-list { flex:1; min-height:0; overflow-y:auto; border:1px solid var(--border); border-radius:8px; background:var(--panel); padding:6px; }
+.st-hist-card { display:flex; align-items:center; gap:10px; padding:6px 8px; border-bottom:1px solid var(--border); }
+.st-hist-card:last-child { border-bottom:none; }
+.st-hist-main { display:flex; flex-direction:column; min-width:0; flex:1; }
+.st-hist-names { font-size:12px; font-weight:600; color:var(--fg); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.st-hist-time { font-size:11px; color:var(--muted); }
+.st-hist-bars { display:flex; flex-direction:column; gap:3px; width:140px; flex-shrink:0; }
+.st-hist-bar { position:relative; height:10px; background:var(--panel-2); border-radius:4px; overflow:hidden; display:block; }
+.st-hist-bar i { display:block; height:100%; border-radius:4px; }
+.st-hist-bar.up i { background:#2563eb; }
+.st-hist-bar.down i { background:#16a34a; }
+.st-hist-bar em { position:absolute; left:6px; top:50%; transform:translateY(-50%); font-size:9px; font-style:normal; color:#fff; text-shadow:0 0 2px rgba(0,0,0,.4); }
 .st-hist-list .page-empty { padding:14px 8px; }
 .ssh-card-main { display:flex; align-items:center; justify-content:space-between; padding:8px 10px; cursor:pointer; gap:6px; min-height:48px; }
 .ssh-card-left { display:flex; align-items:center; gap:8px; min-width:0; flex:1; }

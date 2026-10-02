@@ -3,6 +3,9 @@
 """
 import os
 import time
+import socket
+import threading
+import logging
 import secrets
 import hmac
 import base64
@@ -229,12 +232,118 @@ def generate_turn_credentials(username: str, ttl: int = 604800, turn_secret: str
     return temporary_username, credential
 
 
+# ── L1(延迟): STUN 可达性探测 + 结果缓存 ───────────────────────────
+# 探不到的 STUN(如国内访问 stun.l.google.com)会让 ICE 候选收集/检查白等超时
+# (实测单条约 3s)。探测在后台线程进行, 读缓存不阻塞请求；缓存未命中或过期
+# 按"可达"处理(fail-open), 由后台线程每 60s 刷新。
+STUN_PROBE_TTL = 300
+STUN_PROBE_TIMEOUT = 0.8
+STUN_PROBE_INTERVAL = 60
+
+_stun_cache: dict = {}
+_stun_lock = threading.Lock()
+_stun_thread: Optional[threading.Thread] = None
+_stun_ready = threading.Event()  # 首轮探测完成标记
+
+_STUN_LOGGER = logging.getLogger("pyterm.stun")
+
+
+def _stun_probe(host: str, port: int) -> bool:
+    """发 20 字节 STUN Binding Request(RFC5389), 收到 ≥20 字节响应即视为可达"""
+    try:
+        infos = socket.getaddrinfo(host, port, 0, socket.SOCK_DGRAM)
+        if not infos:
+            return False
+        family, socktype, proto, _, addr = infos[0]
+        s = socket.socket(family, socktype, proto)
+        s.settimeout(STUN_PROBE_TIMEOUT)
+        try:
+            s.sendto(b"\x00\x01\x00\x00" + b"\x21\x12\xa4\x42" + b"\x01" * 12, addr)
+            data, _ = s.recvfrom(2048)
+            # 00xxxxxx = Binding Success Response
+            return len(data) >= 20 and (data[0] & 0xC0) == 0
+        finally:
+            s.close()
+    except Exception as e:
+        _STUN_LOGGER.debug("STUN probe fail %s:%s -> %s", host, port, e)
+        return False
+
+
+def _stun_reachable(host: str, port: int) -> bool:
+    """读结果缓存；未探测/过期按可达处理(fail-open)"""
+    with _stun_lock:
+        hit = _stun_cache.get(f"{host}:{port}")
+    if hit and time.time() - hit[1] <= STUN_PROBE_TTL:
+        return bool(hit[0])
+    return True
+
+
+def _stun_probe_round() -> None:
+    """并行探测全部目标(单轮耗时≈一个超时, 而非 N×超时)"""
+    with _stun_lock:
+        targets = list(_stun_targets)
+
+    def _one(host: str, port: int) -> None:
+        ok = _stun_probe(host, port)
+        with _stun_lock:
+            _stun_cache[f"{host}:{port}"] = (ok, time.time())
+        _STUN_LOGGER.info("STUN probe %s:%s reachable=%s", host, port, ok)
+
+    workers = [threading.Thread(target=_one, args=t, daemon=True) for t in targets]
+    for w in workers:
+        w.start()
+    for w in workers:
+        w.join()
+
+
+def _stun_probe_loop():
+    _stun_probe_round()
+    _stun_ready.set()
+    while True:
+        time.sleep(STUN_PROBE_INTERVAL)
+        _stun_probe_round()
+
+
+_stun_targets: set = set()
+
+
+def _ensure_stun_probe(targets) -> None:
+    """惰性启动后台探测线程(进程内一次)"""
+    global _stun_thread
+    with _stun_lock:
+        _stun_targets.update(targets)
+        if _stun_thread and _stun_thread.is_alive():
+            return
+        _stun_thread = threading.Thread(target=_stun_probe_loop, daemon=True, name="stun-probe")
+        _stun_thread.start()
+
+
+def _stun_entries(server_ip: str, coturn_port: int, reachable) -> list[dict]:
+    """按可达性组装 STUN 条目: 本机/已配置前置, 不可达的不下发(可单测)"""
+    local = (server_ip, coturn_port)
+    google = (("stun.l.google.com", 19302), ("stun1.l.google.com", 19302))
+    entries = []
+    if reachable(*local):
+        entries.append({"urls": ["stun:" + server_ip + ":" + str(coturn_port)]})
+    google_urls = [f"stun:{h}:{p}" for h, p in google if reachable(h, p)]
+    if google_urls:
+        entries.append({"urls": google_urls})
+    if not entries:
+        # 一个都探不通也不能把 STUN 清空 → 保留本机配置项
+        entries.append({"urls": ["stun:" + server_ip + ":" + str(coturn_port)]})
+    return entries
+
+
 def get_ice_servers(user_id: str, coturn_host: str = None, coturn_port: int = 19302, coturn_tls_port: int = 5349, coturn_secret: str = None) -> list[dict]:
     server_ip = os.environ.get("SERVER_PUBLIC_IP", "localhost")
-    ice_servers = [
-        {"urls": ["stun:" + server_ip + ":" + str(coturn_port)]},
-        {"urls": ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"]},
-    ]
+    _ensure_stun_probe([(server_ip, coturn_port),
+                        ("stun.l.google.com", 19302), ("stun1.l.google.com", 19302)])
+    # 首次调用最多等一轮探测: agent/网关只在注册时收一次 ICE 列表,
+    # 拿到 fail-open 的旧列表会一直带着不可达的 STUN(阻塞上限≈1.4s, 仅一次)
+    if not _stun_ready.is_set():
+        _stun_ready.wait(STUN_PROBE_TIMEOUT + 0.6)
+    # L1: 本机 STUN 前置, 探测不可达的不下发(避免客户端白等超时)
+    ice_servers = _stun_entries(server_ip, coturn_port, _stun_reachable)
     if coturn_host:
         username, credential = generate_turn_credentials(user_id, turn_secret=coturn_secret)
         ice_servers.append({

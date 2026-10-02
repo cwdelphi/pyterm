@@ -76,7 +76,9 @@
   "ws.token_expired_gateway": "Token expired",
   "ws.auth_failed": "Authentication failed",
   "ws.agent_offline": "Agent is offline",
+  "ws.agent_no_permission": "No permission to access this Agent",
   "ws.gateway_offline": "Gateway is offline",
+  "ws.gateway_no_permission": "No permission to access this gateway",
   "ws.target_agent_offline": "Target Agent is offline",
   "ws.speedtest_same_agent": "Source and target agent must differ",
   "ws.speedtest_invalid_limit": "Invalid rate limit",
@@ -129,5 +131,8 @@
   "timeline.connect_target": "Connect to target server",
   "timeline.p2p_ice_dc": "WebRTC channel established (Gateway<->Agent)",
   "timeline.browser": "Browser",
-  "timeline.target_server": "Target server"
+  "timeline.target_server": "Target server",
+  "admin.ice_scan_offline": "Agent is offline, cannot scan",
+  "admin.ice_scan_timeout": "ICE scan timed out (5s), check the agent connection",
+  "admin.ice_scan_superseded": "ICE scan superseded by a newer request"
 }

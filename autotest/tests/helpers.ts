@@ -211,6 +211,17 @@ export async function expandGroup(page: Page, groupType: 'ssh' | 'vnc' | 'rdp') 
   }
 }
 
+// 展开「Agent 控制台」分组（缺省折叠；用类名选择器避开 i18n 文案）
+export async function expandAgentGroup(page: Page) {
+  const header = page.locator('.agent-group .group-header').first()
+  const arrow = header.locator('.group-arrow').first()
+  const expanded = await arrow.evaluate(el => el.classList.contains('expanded')).catch(() => false)
+  if (!expanded) {
+    await header.click()
+    await page.waitForTimeout(500)
+  }
+}
+
 export async function clickConn(page: Page, name: string) {
   // 尝试直接查找卡片
   let card = page.locator(`.ssh-card:has-text("${name}")`).first()
