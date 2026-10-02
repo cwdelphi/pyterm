@@ -11,7 +11,8 @@ import (
 	"github.com/ppy-tools/pyagent/pathcache"
 )
 
-// classifyConnType 规则（方案 §4.5）：任一端 relay → relay；两端 host/srflx/prflx → P2P；其余 → BUG
+// ClassifyConnType 规则（方案 §4.5）：任一端 relay → relay；两端 host/srflx/prflx → P2P；其余 → BUG
+// R3: 唯一实现（原 server/handler.go 副本已删，判定表两处合一于此）
 func TestClassifyConnType(t *testing.T) {
 	cases := []struct {
 		local, remote webrtc.ICECandidateType
@@ -19,14 +20,19 @@ func TestClassifyConnType(t *testing.T) {
 	}{
 		{webrtc.ICECandidateTypeHost, webrtc.ICECandidateTypeHost, "P2P"},
 		{webrtc.ICECandidateTypeHost, webrtc.ICECandidateTypeSrflx, "P2P"},
+		{webrtc.ICECandidateTypeSrflx, webrtc.ICECandidateTypeSrflx, "P2P"},
 		{webrtc.ICECandidateTypeSrflx, webrtc.ICECandidateTypePrflx, "P2P"},
+		{webrtc.ICECandidateTypePrflx, webrtc.ICECandidateTypeHost, "P2P"},
 		{webrtc.ICECandidateTypeHost, webrtc.ICECandidateTypeRelay, "relay"},
 		{webrtc.ICECandidateTypeRelay, webrtc.ICECandidateTypeHost, "relay"},
+		{webrtc.ICECandidateTypeSrflx, webrtc.ICECandidateTypeRelay, "relay"},
+		{webrtc.ICECandidateTypeRelay, webrtc.ICECandidateTypeRelay, "relay"},
 		{webrtc.ICECandidateType(99), webrtc.ICECandidateTypeHost, "BUG"},
+		{webrtc.ICECandidateTypeHost, webrtc.ICECandidateType(99), "BUG"},
 	}
 	for _, c := range cases {
-		if got := classifyConnType(c.local, c.remote); got != c.want {
-			t.Errorf("classifyConnType(%v,%v)=%q want %q", c.local, c.remote, got, c.want)
+		if got := ClassifyConnType(c.local, c.remote); got != c.want {
+			t.Errorf("ClassifyConnType(%v,%v)=%q want %q", c.local, c.remote, got, c.want)
 		}
 	}
 }

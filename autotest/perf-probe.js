@@ -280,11 +280,11 @@ async function gotoTmp(p) {
   throw new Error('gotoTmp: /tmp row not found after retries')
 }
 
-async function wireRead() {
-  return page.evaluate(() => (window.__wire ? window.__wire.read() : { bytes: -1, frames: -1 }))
+async function wireRead(pg = page) {
+  return pg.evaluate(() => (window.__wire ? window.__wire.read() : { bytes: -1, frames: -1 }))
 }
-async function wireReset() {
-  return page.evaluate(() => (window.__wire ? window.__wire.reset() : undefined))
+async function wireReset(pg = page) {
+  return pg.evaluate(() => (window.__wire ? window.__wire.reset() : undefined))
 }
 
 async function deleteIfPresent(name) {
@@ -540,20 +540,73 @@ async function ensureConn(name, extra) {
 }
 
 
-async function wireHealthy() {
+async function wireHealthy(pg = page) {
   try {
-    const refresh = page.locator('.sfb-toolbtn').filter({ hasText: '刷新' }).first()
+    const refresh = pg.locator('.sfb-toolbtn').filter({ hasText: '刷新' }).first()
     if (!(await refresh.isVisible({ timeout: 4000 }).catch(() => false))) return false
-    await wireReset()
+    await wireReset(pg)
     await refresh.click().catch(() => undefined)
     const dl = Date.now() + 12000
     while (Date.now() < dl) {
-      const w = await wireRead().catch(() => ({ rbytes: 0 }))
+      const w = await wireRead(pg).catch(() => ({ rbytes: 0 }))
       if (w.rbytes > 0) return true
-      await page.waitForTimeout(300)
+      await pg.waitForTimeout(300)
     }
     return false
   } catch (e) { return false }
+}
+
+/** S4 connect 相位：VNC 连接计时（在独立 page 上与 SSH 并发） */
+async function connectVncOn(p) {
+  let t0 = Date.now()
+  try {
+    await p.goto(BASE, { waitUntil: 'domcontentloaded' }).catch(() => undefined)
+    await p.waitForTimeout(1500)
+    await goSshView(p)
+    await p.waitForTimeout(600)
+    await expandGroup(p, 'vnc')
+    let card = p.locator(`.ssh-card:has-text("${VCONN}")`).first()
+    if (!(await card.isVisible({ timeout: 5000 }).catch(() => false))) {
+      await expandGroup(p, 'vnc')
+      card = p.locator(`.ssh-card:has-text("${VCONN}")`).first()
+    }
+    if (!(await card.isVisible({ timeout: 8000 }).catch(() => false))) return { ok: false, ms: Date.now() - t0, err: 'vnc card not visible' }
+    t0 = Date.now()
+    await card.locator('.ssh-card-main').click()
+    await p.waitForTimeout(400)
+    await p.locator('.ssh-sub-btn.type-vnc').first().click({ timeout: 8000 })
+    const canvas = p.locator('.vnc-canvas-wrap canvas').first()
+    const status = p.locator('.vnc-status').first()
+    const dl = Date.now() + 60000
+    while (Date.now() < dl) {
+      const vis = await canvas.isVisible().catch(() => false)
+      const cls = (await status.getAttribute('class').catch(() => '')) || ''
+      if (vis && /connected/.test(cls)) return { ok: true, ms: Date.now() - t0 }
+      await p.waitForTimeout(200)
+    }
+    const stTxt = ((await status.getAttribute('class').catch(() => '')) || '') + '|' + ((await status.textContent().catch(() => '')) || '')
+    return { ok: false, ms: Date.now() - t0, err: `vnc timeout: ${stTxt.slice(0, 120)}` }
+  } catch (e) {
+    return { ok: false, ms: Date.now() - t0, err: String(e).split('\n')[0] }
+  }
+}
+
+/** S4 connect 相位：SSH(FILE) 连接计时（主 page，与 VNC 并发） */
+async function connectSshOn(p) {
+  let t0 = Date.now()
+  try {
+    await goSshView(p)
+    await clickConn(p, CONN)
+    t0 = Date.now()
+    await p.locator('.ssh-sub-btn.type-file').first().click({ timeout: 8000 })
+    await p.locator('.sfb').first().waitFor({ state: 'visible', timeout: 30000 })
+    const usable = await ensureListUsable(p, 2)
+    if (!usable) return { ok: false, ms: Date.now() - t0, err: 'list unusable' }
+    const healthy = await wireHealthy(p)
+    return { ok: healthy, ms: Date.now() - t0, err: healthy ? undefined : 'dc not ready' }
+  } catch (e) {
+    return { ok: false, ms: Date.now() - t0, err: String(e).split('\n')[0] }
+  }
 }
 
 /** 打开 FILE 面板并确认 DC 有入向流量（ICE/DC 就绪），失败返回 false */
@@ -594,9 +647,11 @@ async function cleanup() {
   const listResp = await api('get', '/api/ssh')
   const conns = await listResp.json().catch(() => [])
   const arr = Array.isArray(conns) ? conns : conns.data || []
+  // connect 相位：连接由 fleet 脚本串行预建/清理（并发删会竞态 ssh_connections.json）
+  if (PHASES.has('connect')) return
   for (const c of arr) {
     if (c.name && (c.name === CONN || c.name === VCONN)) {
-      await api('delete', `/api/ssh/${c.id}`).catch(() => undefined)
+      await api('post', '/api/ssh/delete', { id: c.id }).catch(() => undefined)
     }
   }
 }
@@ -620,10 +675,21 @@ async function cleanup() {
   await ensureConn(CONN)
   await ensureConn(VCONN, { connection_type: 'vnc' })
 
-  const f1 = Array.from({ length: REPS }, (_, i) => makeFile(SIZE_1M, `_r${i}`))
-  const f10 = Array.from({ length: REPS }, (_, i) => makeFile(SIZE_10M, `_r${i}`))
+  if (PHASES.has('connect')) {
+    // ── S4 并发建连：同页 SSH(FILE) 与独立页 VNC 并发打开，各自计时 ──
+    step('connect phase begin')
+    const p2 = await ctx.newPage()
+    p2.on('pageerror', (e) => R.notes.push(`p2 pageerror: ${e.message}`))
+    const tAll = Date.now()
+    const [ssh, vnc] = await Promise.all([connectSshOn(page), connectVncOn(p2)])
+    R.connect = { ssh, vnc, total_ms: Date.now() - tAll }
+    await p2.close().catch(() => undefined)
+    step(`connect phase done ${JSON.stringify(R.connect)}`)
+  }
 
   if (PHASES.has('file')) {
+  const f1 = Array.from({ length: REPS }, (_, i) => makeFile(SIZE_1M, `_r${i}`))
+  const f10 = Array.from({ length: REPS }, (_, i) => makeFile(SIZE_10M, `_r${i}`))
   // ── 单次建链：打开 FILE 面板并确认 DC 就绪（未就绪则 reload 重建）──
   step('open session')
   if (!(await openSession('session'))) throw new Error('file browser session not ready')
@@ -697,6 +763,7 @@ async function cleanup() {
   console.log(JSON.stringify({
     label: LABEL,
     p8_list: R.p8_list,
+    connect: R.connect,
     p1_bytes_1mb: R.p1_upload_1mb?.bytes,
     p1_frames_1mb: R.p1_upload_1mb?.frames,
     p1_ms_1mb: R.p1_upload_1mb?.ms,

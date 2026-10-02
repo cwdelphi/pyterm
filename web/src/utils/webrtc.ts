@@ -453,6 +453,9 @@ export class WebRTCManager {
     this.clearVncDefer()
     this.clearVncConnectRetry()
     this.diag.start = performance.now()
+    // 清上一会话残留：connTypeDetected 不清会把旧会话(甚至旧网关模式)的检测值
+    // 带进本会话首报，导致 direct 行错标上一次 gateway 的测量结果
+    this.diag.connTypeDetected = ""
     this.diag.wsOpen = 0
     this.diag.signalOk = 0
     this.diag.rtcConnected = 0
@@ -1653,27 +1656,33 @@ export class WebRTCManager {
       } catch {}
     }
     try {
-      let pc = this.peerConnection
-      if (!pc) return
-      log(LogLevel.DEBUG, "BA-DC", "detectConnType: waiting 1.5s for ICE to settle...")
-      await new Promise((r) => setTimeout(r, 1500))
-      pc = this.peerConnection
-      if (!pc) return
-      if (pc.connectionState !== "connected") {
-        log(LogLevel.WARN, "BA-DC", "detectConnType: connection not connected, state:", pc.connectionState)
-        return
-      }
+      if (!this.peerConnection) return
+      // 多轮快速探测：立即/500ms/1s/2s。数百 ms 即断的短会话在关闭前就能拿到
+      // nominated pair；旧逻辑固定先等 1.5s，秒断会话永远停在静默 return → DC 链路列空。
       let connType = "unknown"
-      for (let i = 0; i < 3; i++) {
-        pc = this.peerConnection
-        if (!pc) return
-        const stats = await pc.getStats()
-        connType = this.parseConnType(stats)
-        log(LogLevel.DEBUG, "BA-DC", "detectConnType attempt", i + 1, ":", connType)
+      let lastState = ""
+      for (const wait of [0, 500, 1000, 2000]) {
+        if (wait > 0) await new Promise((r) => setTimeout(r, wait))
+        const pc = this.peerConnection
+        if (!pc) return // 会话已销毁：放弃且不误报
+        lastState = pc.connectionState
+        try {
+          connType = this.parseConnType(await pc.getStats())
+        } catch (ge) {
+          log(LogLevel.DEBUG, "BA-DC", "detectConnType getStats failed:", ge)
+        }
+        log(LogLevel.DEBUG, "BA-DC", `detectConnType @${wait}ms:`, connType, "state:", lastState)
         if (connType !== "unknown") break
-        await new Promise((r) => setTimeout(r, 1000))
       }
-      if (connType === "unknown") connType = "BUG"
+      if (connType === "unknown") {
+        // 全程测不出：连接仍存活才算 BUG；已断开则静默（值无意义且会污染），
+        // 由服务端 pending 合并兜底。
+        if (lastState !== "connected") {
+          log(LogLevel.WARN, "BA-DC", "detectConnType: connection gone before settle, skip report")
+          return
+        }
+        connType = "BUG"
+      }
       this.diag.connTypeDetected = connType
       log(LogLevel.INFO, "BA-DC", "Final connection type:", connType)
       report(connType)
@@ -1703,14 +1712,15 @@ export class WebRTCManager {
         .then(r => {
           if (r.ok) return
           console.error("[DIAG] webrtc-path report failed:", r.status, r.statusText)
-          // 404/409 = 首报尚未落库的竞态：1.5s 后重试一次（attempt 上限防循环）
-          if (attempt === 0 && (r.status === 404 || r.status === 409)) {
-            setTimeout(() => this.reportWebRtcPath(path, attempt + 1), 1500)
+          // 404/409 = 首报尚未落库的竞态：3 次指数退避重试（1.5s/3s），
+          // 旧逻辑仅重试 1 次，二次失败即永久空值
+          if (attempt < 2 && (r.status === 404 || r.status === 409)) {
+            setTimeout(() => this.reportWebRtcPath(path, attempt + 1), 1500 * (attempt + 1))
           }
         })
         .catch(e => {
           console.error("[DIAG] webrtc-path report error:", e)
-          if (attempt === 0) setTimeout(() => this.reportWebRtcPath(path, attempt + 1), 1500)
+          if (attempt < 2) setTimeout(() => this.reportWebRtcPath(path, attempt + 1), 1500 * (attempt + 1))
         })
     } catch {}
   }

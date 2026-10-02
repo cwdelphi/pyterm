@@ -61,6 +61,11 @@ type Cache struct {
 	dir     string
 	ttl     time.Duration
 	entries map[string]Entry
+	// P2 #12: 脏标记 + 5s 批量落盘（旧实现 Lookup/Record 每次全量 marshal+WriteFile，
+	// 持锁阻塞 ICE 建连关键路径；进程退出最多丢一个窗口，缓存本就可再生）
+	dirty    bool
+	flushing bool
+	lastSave time.Time
 }
 
 // New 创建一个独立缓存（单测用）；dir 为空表示纯内存。
@@ -242,28 +247,116 @@ func (c *Cache) load() {
 	}
 }
 
-// save 落盘（目录不存在尝试创建；任何失败静默降级为纯内存）
+// saveInterval 落盘节流窗口（P2 #12）
+const saveInterval = 5 * time.Second
+
+// save 标脏并按 5s 窗口批量落盘（调用方须持 c.mu）；dir 为空（纯内存/单测）直接跳过。
+// 首次变更同步落盘（进程内一次，避免测试/关停时异步写与目录清理竞态），其余变更异步并入窗口。
 func (c *Cache) save() {
-	p := c.path()
-	if p == "" {
+	path := c.path()
+	if path == "" {
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+	c.dirty = true
+	if c.flushing {
 		return
 	}
+	if c.lastSave.IsZero() {
+		st := c.snapshotLocked()
+		c.dirty = false
+		c.lastSave = time.Now()
+		writeTo(path, st)
+		return
+	}
+	c.flushing = true
+	delay := saveInterval - time.Since(c.lastSave)
+	if delay < 0 {
+		delay = 0
+	}
+	go func() {
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+		c.flush(path)
+	}()
+}
+
+// flush 快照标脏内容 → 锁外 marshal+写盘；写盘期间的变更继续标脏，写完再排下一轮窗口。
+// flushing 在写盘完成后才清除，保证 Flush() 排空等待时文件已就绪。
+// 落盘前复核 path（SetDir 切目录时放弃写入，避免把新目录内容写进旧路径）。
+func (c *Cache) flush(path string) {
+	c.mu.Lock()
+	if path != c.path() || !c.dirty {
+		c.flushing = false
+		c.mu.Unlock()
+		return
+	}
+	st := c.snapshotLocked()
+	c.dirty = false
+	c.lastSave = time.Now()
+	c.mu.Unlock()
+	writeTo(path, st)
+	c.mu.Lock()
+	if c.dirty {
+		// 写盘期间又有变更：flushing 保持在途，5s 后接续下一轮
+		next := c.path()
+		go func() {
+			time.Sleep(saveInterval)
+			c.flush(next)
+		}()
+	} else {
+		c.flushing = false
+	}
+	c.mu.Unlock()
+}
+
+// Flush 同步落盘（测试/关停用）：等待在途异步窗口结束，再把残余脏数据立即写出。
+func (c *Cache) Flush() {
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		c.mu.Lock()
+		busy := c.flushing
+		c.mu.Unlock()
+		if !busy || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	c.mu.Lock()
+	path := c.path()
+	if path == "" || !c.dirty {
+		c.mu.Unlock()
+		return
+	}
+	st := c.snapshotLocked()
+	c.dirty = false
+	c.lastSave = time.Now()
+	c.mu.Unlock()
+	writeTo(path, st)
+}
+
+// snapshotLocked 排序快照（调用方须持 c.mu）
+func (c *Cache) snapshotLocked() fileState {
 	st := fileState{Entries: make([]Entry, 0, len(c.entries))}
 	for _, e := range c.entries {
 		st.Entries = append(st.Entries, e)
 	}
 	sort.Slice(st.Entries, func(i, j int) bool { return st.Entries[i].UpdatedAt > st.Entries[j].UpdatedAt })
+	return st
+}
+
+// writeTo marshal + tmp 原子写盘（锁外执行；目录只读等失败静默降级为纯内存）
+func writeTo(path string, st fileState) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return
+	}
 	data, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
 		return
 	}
-	tmp := p + ".tmp"
+	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		// 目录只读（如容器只读根）→ 退化为内存缓存
 		return
 	}
-	_ = os.Rename(tmp, p)
+	_ = os.Rename(tmp, path)
 }

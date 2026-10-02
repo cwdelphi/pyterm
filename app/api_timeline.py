@@ -1,10 +1,11 @@
 import json
+import time
 from datetime import datetime
 from typing import Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
-from sqlalchemy import select, func, desc, and_
+from sqlalchemy import select, func, desc, and_, update
 from sqlalchemy.exc import IntegrityError, OperationalError, DataError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,6 +14,34 @@ from .auth_api import get_current_user
 from .i18n import t
 
 timeline_router = APIRouter(prefix="/api/timeline", tags=["timeline"])
+
+
+# ── DC 链路补报 pending 缓存 ──
+# 补报(/webrtc-path)可能早于首报(/report)落库：记录不存在时先挂起（原来直接 404
+# 丢弃、浏览器仅短重试 → webrtc_path 永久空）。/report 落库时该列仍空则套用。
+# TTL 5 分钟 + 容量上限，防积压与滥用。
+# key=(user_id, room_id)：pending 归属提交者，别人无法给尚未落库的 room 预置标注
+_pending_webrtc_path: dict[tuple[str, str], tuple[str, float]] = {}
+_PENDING_TTL = 300.0
+_PENDING_MAX = 500
+
+
+def _pending_put(user_id: str, room_id: str, path: str) -> None:
+    key = (user_id, room_id)
+    now = time.monotonic()
+    for k in [k for k, (_, ts) in list(_pending_webrtc_path.items()) if now - ts > _PENDING_TTL]:
+        del _pending_webrtc_path[k]
+    if len(_pending_webrtc_path) >= _PENDING_MAX and key not in _pending_webrtc_path:
+        del _pending_webrtc_path[min(_pending_webrtc_path, key=lambda k: _pending_webrtc_path[k][1])]
+    _pending_webrtc_path[key] = (path, now)
+
+
+def _pending_pop(user_id: str, room_id: str) -> str:
+    ent = _pending_webrtc_path.pop((user_id, room_id), None)
+    if not ent:
+        return ""
+    path, ts = ent
+    return path if time.monotonic() - ts <= _PENDING_TTL else ""
 
 
 # ── Request/Response Models ──
@@ -836,6 +865,11 @@ async def _upsert_timeline(req: TimelineReport, db: AsyncSession, user: dict, no
         updates["updated_at"] = now
         for k, v in updates.items():
             setattr(record, k, v)
+        # 首报未带 DC 链路且后到补报也没写上 → 套用挂起的 pending（404 竞态根治）
+        if not record.webrtc_path:
+            _p = _pending_pop(user["id"], req.room_id)
+            if _p:
+                record.webrtc_path = _p
     else:
         record = ConnectionTimeline(
             room_id=req.room_id,
@@ -863,7 +897,7 @@ async def _upsert_timeline(req: TimelineReport, db: AsyncSession, user: dict, no
             browser=req.browser,
             os_info=req.os_info,
             connected_at=req.connected_at,
-            webrtc_path=_trunc(req.webrtc_path, 16),
+            webrtc_path=_trunc(req.webrtc_path, 16) or _pending_pop(user["id"], req.room_id),
             created_at=now,
             updated_at=now,
         )
@@ -911,26 +945,53 @@ async def update_webrtc_path(req: WebRtcPathReq, db: AsyncSession = Depends(get_
     """补报 DC 链路标注（P2P/relay/BUG）：只更新 webrtc_path 一列。
     时序说明：detectConnType 需 RTC connected 后 1.5s~4.5s，常晚于首包触发的
     reportDiagnostic（一次性），因此检测结果晚到时走本端点补报，
-    不复用 /report 以免重算 steps/success 写坏原记录。"""
+    不复用 /report 以免重算 steps/success 写坏原记录。
+    并发：单语句 UPDATE + 1020/死锁静默重试 1 次（详见下方注释）。"""
     if not req.room_id:
         raise HTTPException(status_code=400, detail="room_id required")
     path = _trunc(req.webrtc_path, 16)
     if path not in ("P2P", "relay", "BUG"):
         raise HTTPException(status_code=400, detail="invalid webrtc_path")
-    result = await db.execute(
-        select(ConnectionTimeline).where(
+    # V1: 单语句 UPDATE（原实现同事务先 SELECT 后改列 → 与并发 /report 撞车时
+    # MariaDB 抛 (1020, Record has changed) → 本端点 500；先写后不再读即无此竞态）
+    stmt = (
+        update(ConnectionTimeline)
+        .where(
             ConnectionTimeline.room_id == req.room_id,
             ConnectionTimeline.user_id == user["id"],
         )
+        .values(webrtc_path=path, updated_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     )
-    record = result.scalar_one_or_none()
-    if not record:
-        raise HTTPException(status_code=404, detail="not found")
-    if path:  # 空值不覆盖已有标注
-        record.webrtc_path = path
-        record.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        await db.commit()
-    return {"ok": True, "room_id": req.room_id, "webrtc_path": record.webrtc_path}
+    updated = False
+    for attempt in range(2):
+        try:
+            result = await db.execute(stmt)
+            await db.commit()
+            updated = (result.rowcount or 0) > 0
+            break
+        except (IntegrityError, OperationalError, DataError):
+            # 1020（并发改同记录）/1213 死锁：回滚后静默重试 1 次，不刷栈不回 500
+            await db.rollback()
+            if attempt:
+                # 仍失败（DB 抖动）：改挂 pending 兜底，标注不丢
+                _pending_put(user["id"], req.room_id, path)
+                return {"ok": True, "room_id": req.room_id, "webrtc_path": path, "pending": True}
+    if not updated:
+        # rowcount=0 = 行不存在（首报未落库）或值本就相同（MySQL 只报变更行）
+        owner = (
+            await db.execute(
+                select(ConnectionTimeline.user_id).where(ConnectionTimeline.room_id == req.room_id)
+            )
+        ).scalar_one_or_none()
+        if owner is None:
+            # 首报(/report)尚未落库：挂 pending，由 /report 落库时套用。
+            # 原来直接 404（浏览器仅短重试 1 次）→ DC 链路列永久空。
+            _pending_put(user["id"], req.room_id, path)
+            return {"ok": True, "room_id": req.room_id, "webrtc_path": path, "pending": True}
+        if owner != user["id"]:
+            # 他人记录：保持 404（TC-WP04），也不允许往 pending 写别人的标注
+            raise HTTPException(status_code=404, detail="timeline record not found")
+    return {"ok": True, "room_id": req.room_id, "webrtc_path": path}
 
 
 @timeline_router.post("/records")

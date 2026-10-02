@@ -11,6 +11,7 @@ import (
 	"github.com/pion/webrtc/v4"
 
 	"github.com/ppy-tools/pyagent/icefilter"
+	wrtc "github.com/ppy-tools/pyagent/webrtc"
 )
 
 // ── P2 三级回退阶梯（docs/传输优化_ICE优化与接口过滤方案_v2.0.md §4.5）──────
@@ -201,7 +202,7 @@ func (h *Handler) recordPath(session *Session, gen int, roomID, agentID string, 
 		log.Printf("[ICE-LADDER] 无法映射胜出接口 %s, 跳过缓存", pair.Local.Address)
 		return
 	}
-	connType := classifyConnType(pair.Local.Typ, pair.Remote.Typ)
+	connType := wrtc.ClassifyConnType(pair.Local.Typ, pair.Remote.Typ)
 	if h.pathCache != nil {
 		h.pathCache.Record(agentID, iface, currentIfHash(), connType, 0)
 	}

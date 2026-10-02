@@ -217,7 +217,7 @@ func recordPathCache(pc *webrtc.PeerConnection, level int) {
 		log.Printf("[ICE-LADDER] 无法映射胜出接口 %s, 跳过缓存", pair.Local.Address)
 		return
 	}
-	connType := classifyConnType(pair.Local.Typ, pair.Remote.Typ)
+	connType := ClassifyConnType(pair.Local.Typ, pair.Remote.Typ)
 	hash := currentIfHash()
 	pathcache.Default().Record(pathcache.CacheKey, iface, hash, connType, 0)
 	log.Printf("[ICE-LADDER] 命中本地接口 %s (conn_type=%s level=%d)", iface, connType, level)
@@ -269,9 +269,10 @@ func ifaceForIP(ip string) string {
 	return ""
 }
 
-// classifyConnType 与浏览器 parseConnType 规则对齐：任一端 relay → relay，
-// 两端均为 host/srflx/prflx → P2P，其余 → BUG
-func classifyConnType(local, remote webrtc.ICECandidateType) string {
+// ClassifyConnType 与浏览器 parseConnType 规则对齐：任一端 relay → relay，
+// 两端均为 host/srflx/prflx → P2P，其余 → BUG。
+// R3: 唯一实现，server 包（网关 reportConnType / ICE 阶梯）经 wrtc.ClassifyConnType 调用。
+func ClassifyConnType(local, remote webrtc.ICECandidateType) string {
 	if local == webrtc.ICECandidateTypeRelay || remote == webrtc.ICECandidateTypeRelay {
 		return "relay"
 	}

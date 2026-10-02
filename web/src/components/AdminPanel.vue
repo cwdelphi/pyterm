@@ -339,6 +339,68 @@ async function copyAgentToken(token: string) {
   toast?.success(t('admin.copiedToClipboard'))
 }
 
+/* ── 程序下载：配置样例（静态占位符；server_url 自动填充门户域名，绝不嵌真实 token） ── */
+const sampleIce = ref(false)
+const sampleCopied = ref<'' | 'agent' | 'gw'>('')
+let sampleCopiedTimer: ReturnType<typeof setTimeout> | null = null
+const portalWsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/api/ws/webrtc`
+const agentSampleJson = computed(() => JSON.stringify({
+  mode: 'agent',
+  server_url: portalWsUrl,
+  agent_id: '<AGENT_ID>',
+  auth_token: '<AUTH_TOKEN>',
+}, null, 2))
+const gatewaySampleJson = computed(() => {
+  const o: Record<string, unknown> = {
+    mode: 'gateway',
+    listen: ':5599',
+    tls_cert: '/etc/pyagent/ssl/cert.pem',
+    tls_key: '/etc/pyagent/ssl/key.pem',
+    server_url: portalWsUrl,
+    gateway_id: '<GATEWAY_ID>',
+    gateway_token: '<GATEWAY_TOKEN>',
+    log_level: 'info',
+    heartbeat_interval: 30,
+    read_timeout: 60,
+    write_timeout: 60,
+  }
+  if (sampleIce.value) {
+    Object.assign(o, { ice_interface_filter: true, ice_allow_tailscale: false, ice_auto_fallback: true, ice_path_cache: true })
+  }
+  return JSON.stringify(o, null, 2)
+})
+async function copySample(which: 'agent' | 'gw') {
+  const text = which === 'agent' ? agentSampleJson.value : gatewaySampleJson.value
+  try {
+    await navigator.clipboard.writeText(text)
+  } catch {
+    // 非安全上下文/权限拒绝时的兜底：隐藏 textarea + execCommand
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.style.position = 'fixed'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.select()
+    document.execCommand('copy')
+    ta.remove()
+  }
+  sampleCopied.value = which
+  if (sampleCopiedTimer) clearTimeout(sampleCopiedTimer)
+  sampleCopiedTimer = setTimeout(() => { sampleCopied.value = '' }, 1600)
+}
+function downloadSample(which: 'agent' | 'gw') {
+  const name = which === 'agent' ? 'config.json' : 'config-gateway.json'
+  const text = which === 'agent' ? agentSampleJson.value : gatewaySampleJson.value
+  const url = URL.createObjectURL(new Blob([text], { type: 'application/json' }))
+  const a = document.createElement('a')
+  a.href = url
+  a.download = name
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+
 async function doDeleteAgent() {
   try { await api.adminDeleteAgent(deleteAgentId.value); showDeleteAgent.value = false; await loadAgents(); toast?.success(t('admin.deleted')) } catch (e: any) { toast?.error(e.message) }
 }
@@ -1094,46 +1156,61 @@ function fmtAuditTime(ts: string): string {
           <div class="download-card">
             <div class="download-card-header">
               <span class="download-icon">🤖</span>
-              <h3>wragent</h3>
-              <span class="download-tag">{{ t('admin.remoteTerminalAgent') }}</span>
+              <h3>pyagent</h3>
+              <span class="download-tag">{{ t('admin.pyagentTag') }}</span>
             </div>
             <p class="download-desc">{{ t('admin.downloadDesc1') }}</p>
             <div class="download-list">
-              <a class="download-item" :href="`/api/deploy/wragent/linux-amd64`" download>
+              <a class="download-item" :href="`/api/deploy/pyagent/linux-amd64`" download>
                 <span class="download-platform">🐧 Linux (x86_64)</span>
                 <span class="download-btn">{{ t('admin.downloadBtn') }}</span>
               </a>
-              <a class="download-item" :href="`/api/deploy/wragent/linux-arm64`" download>
+              <a class="download-item" :href="`/api/deploy/pyagent/linux-arm64`" download>
                 <span class="download-platform">🐧 Linux (ARM64)</span>
                 <span class="download-btn">{{ t('admin.downloadBtn') }}</span>
               </a>
-              <a class="download-item" :href="`/api/deploy/wragent/windows-amd64`" download>
+              <a class="download-item" :href="`/api/deploy/pyagent/windows-amd64`" download>
                 <span class="download-platform">🪟 Windows (x86_64)</span>
                 <span class="download-btn">{{ t('admin.downloadBtn') }}</span>
               </a>
             </div>
           </div>
 
+          <!-- 卡2：Agent 配置样例（可复制/可下载） -->
           <div class="download-card">
             <div class="download-card-header">
-              <span class="download-icon">🌉</span>
-              <h3>wrgateway</h3>
-              <span class="download-tag">{{ t('admin.webrtcGateway') }}</span>
+              <span class="download-icon">⚙️</span>
+              <h3>{{ t('admin.sampleAgentTitle') }}</h3>
+              <span class="download-tag">config.json</span>
             </div>
-            <p class="download-desc">{{ t('admin.downloadDesc2') }}</p>
-            <div class="download-list">
-              <a class="download-item" :href="`/api/deploy/wrgateway/linux-amd64`" download>
-                <span class="download-platform">🐧 Linux (x86_64)</span>
-                <span class="download-btn">{{ t('admin.downloadBtn') }}</span>
-              </a>
-              <a class="download-item" :href="`/api/deploy/wrgateway/linux-arm64`" download>
-                <span class="download-platform">🐧 Linux (ARM64)</span>
-                <span class="download-btn">{{ t('admin.downloadBtn') }}</span>
-              </a>
-              <a class="download-item" :href="`/api/deploy/wrgateway/windows-amd64`" download>
-                <span class="download-platform">🪟 Windows (x86_64)</span>
-                <span class="download-btn">{{ t('admin.downloadBtn') }}</span>
-              </a>
+            <p class="download-desc">{{ t('admin.sampleDescAgent') }}</p>
+            <div class="sample-json"><pre>{{ agentSampleJson }}</pre></div>
+            <div class="sample-actions">
+              <button class="sample-btn" :class="{ ok: sampleCopied === 'agent' }" @click="copySample('agent')">
+                {{ sampleCopied === 'agent' ? t('admin.copied') + ' ✓' : t('admin.copyJson') }}
+              </button>
+              <button class="sample-btn" @click="downloadSample('agent')">{{ t('admin.downloadBtn') }} config.json</button>
+            </div>
+          </div>
+
+          <!-- 卡3：网关配置样例（可复制/可下载，含 ICE 高级字段折叠） -->
+          <div class="download-card">
+            <div class="download-card-header">
+              <span class="download-icon">🌐</span>
+              <h3>{{ t('admin.sampleGatewayTitle') }}</h3>
+              <span class="download-tag">config-gateway.json</span>
+            </div>
+            <p class="download-desc">{{ t('admin.sampleDescGateway') }}</p>
+            <div class="sample-json"><pre>{{ gatewaySampleJson }}</pre></div>
+            <label class="sample-ice">
+              <input type="checkbox" v-model="sampleIce" />
+              {{ t('admin.advIce') }}
+            </label>
+            <div class="sample-actions">
+              <button class="sample-btn" :class="{ ok: sampleCopied === 'gw' }" @click="copySample('gw')">
+                {{ sampleCopied === 'gw' ? t('admin.copied') + ' ✓' : t('admin.copyJson') }}
+              </button>
+              <button class="sample-btn" @click="downloadSample('gw')">{{ t('admin.downloadBtn') }} config-gateway.json</button>
             </div>
           </div>
         </div>
@@ -1714,7 +1791,7 @@ function fmtAuditTime(ts: string): string {
 .pwd-form input { width:100%; padding:8px 10px; border:1px solid var(--border); border-radius:6px; background:var(--panel-2); color:var(--fg); font-size:14px; }
 
 /* 程序下载 */
-.downloads-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); gap:20px; padding:8px 0; }
+.downloads-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); gap:20px; padding:8px 0; max-width:960px; }
 .download-card { background:var(--panel); border:1px solid var(--border); border-radius:10px; overflow:hidden; }
 .download-card-header { display:flex; align-items:center; gap:10px; padding:16px 20px; border-bottom:1px solid var(--border); background:var(--panel-2); }
 .download-icon { font-size:24px; }
@@ -1726,6 +1803,17 @@ function fmtAuditTime(ts: string): string {
 .download-platform { font-size:13px; font-weight:500; }
 .download-btn { font-size:12px; color:var(--accent); font-weight:600; }
 .download-tag { margin-left:auto; font-size:11px; padding:2px 10px; border-radius:999px; background:var(--accent-soft); color:var(--accent); font-weight:600; white-space:nowrap; }
+
+/* 配置样例卡 */
+.sample-json { margin:0 20px 12px; padding:12px 14px; background:var(--panel-2); border:1px solid var(--border); border-radius:8px; max-height:230px; overflow:auto; }
+.sample-json pre { margin:0; font:12px/1.65 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color:var(--fg-2); white-space:pre; }
+.sample-actions { display:flex; gap:8px; padding:0 20px 16px; }
+.sample-btn { flex:1; padding:9px 12px; border:1px solid var(--border); border-radius:8px; background:var(--panel-2); color:var(--fg); font-size:13px; font-weight:500; cursor:pointer; transition:all .15s; text-align:center; }
+.sample-btn:hover { border-color:var(--accent); background:var(--accent-soft); color:var(--accent); }
+.sample-btn:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+.sample-btn.ok { border-color:#16a34a; background:rgba(22,163,74,.1); color:#16a34a; }
+.sample-ice { display:flex; align-items:center; gap:7px; padding:0 20px 12px; font-size:12px; color:var(--fg-2); cursor:pointer; user-select:none; }
+.sample-ice input { accent-color:var(--accent); cursor:pointer; }
 
 .ver-badge { display:inline-block; padding:2px 8px; border-radius:4px; font-size:12px; font-weight:600; background:#e0e7ff; color:#4f46e5; white-space:nowrap; }
 .ver-badge.old { background:#fef3c7; color:#d97706; }

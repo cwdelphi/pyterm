@@ -790,14 +790,17 @@ func tunnelSend(dc *webrtc.DataChannel, prefix byte, connID uint16, payload []by
 	if len(payload) > tunnelMaxPayload {
 		return fmt.Errorf("tunnel payload %d > %d (prefix=0x%02x connID=%d)", len(payload), tunnelMaxPayload, prefix, connID)
 	}
-	msg := make([]byte, 3+len(payload))
+	// P2 #11: 帧缓冲池化（pion Send 同步拷贝，返回即可归还）
+	msg := takeFrameBuf(3 + len(payload))
 	msg[0] = prefix
 	binary.BigEndian.PutUint16(msg[1:3], connID)
 	copy(msg[3:], payload)
-	if err := dc.Send(msg); err != nil {
-		return fmt.Errorf("dc send failed (prefix=0x%02x connID=%d len=%d): %w", prefix, connID, len(msg), err)
+	err := sendFrameDC(dc, msg)
+	if err != nil {
+		err = fmt.Errorf("dc send failed (prefix=0x%02x connID=%d len=%d): %w", prefix, connID, len(msg), err)
 	}
-	return nil
+	releaseFrameBuf(msg)
+	return err
 }
 
 // connID分配器

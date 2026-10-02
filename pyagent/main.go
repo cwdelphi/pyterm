@@ -15,6 +15,8 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -394,6 +396,9 @@ func main() {
 		return
 	}
 
+	// T1: 内存/调度旋钮启动调节（agent/gateway 双模式共用），先于 pprof/业务 goroutine
+	tuneRuntime()
+
 	// P3 #19: 按需 pprof（长稳/GC 验收的观测前提），两种模式都需要
 	startPprof()
 
@@ -402,4 +407,72 @@ func main() {
 		return
 	}
 	runAgent(cfg, *configPath)
+}
+
+// tuneRuntime T1 硬件自适应：env GOMEMLIMIT 显式值永远优先（Go 运行时自动读取，
+// 此处只记录不覆盖）；未设置时按 cgroup 限额或宿主 RAM 推导软限：
+// min(来源×0.5, 2GiB)，下限 128MiB，debug.SetMemoryLimit 应用。
+// GOMAXPROCS 只验证打日志不改值（Go1.25+ cgroup-aware 默认已按配额推导）。
+// S8 实测：容器 256MiB 软限下 live set 仅 2–4MB 从未触发，软限定位是 OOM 保险丝，
+// 勿改 GOGC 追求降频（GOGC=10 反使 GC 频率 ×2.3、总暂停 ×1.8）。
+func tuneRuntime() {
+	src := "env"
+	limitStr := os.Getenv("GOMEMLIMIT")
+	if limitStr == "" {
+		if bytes, ok := memoryLimitSource(&src); ok {
+			const (
+				maxLimit = int64(2) << 30 // 上限 2GiB
+				minLimit = int64(128) << 20
+				half     = 2
+			)
+			limit := bytes / half
+			if limit > maxLimit {
+				limit = maxLimit
+			}
+			if limit < minLimit {
+				limit = minLimit
+			}
+			debug.SetMemoryLimit(limit)
+			limitStr = strconv.FormatInt(limit>>20, 10) + "MiB"
+		} else {
+			src = "none"
+			limitStr = "未设置"
+		}
+	}
+	log.Printf("[TUNE] GOMEMLIMIT=%s(%s) GOMAXPROCS=%d nproc=%d",
+		limitStr, src, runtime.GOMAXPROCS(0), runtime.NumCPU())
+}
+
+// memoryLimitSource 返回推导 GOMEMLIMIT 的字节来源：cgroup v2 → cgroup v1 → 宿主 RAM。
+// src 记录命中层级（cgroup2/cgroup1/ram）。
+func memoryLimitSource(src *string) (int64, bool) {
+	if b, err := os.ReadFile("/sys/fs/cgroup/memory.max"); err == nil { // v2: "max" = 无限制
+		s := strings.TrimSpace(string(b))
+		if s != "max" {
+			if v, err := strconv.ParseInt(s, 10, 64); err == nil && v > 0 {
+				*src = "cgroup2"
+				return v, true
+			}
+		}
+	}
+	if b, err := os.ReadFile("/sys/fs/cgroup/memory/memory.limit_in_bytes"); err == nil { // v1: 无限制≈maxint64
+		if v, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64); err == nil && v > 0 && v < (1<<50) {
+			*src = "cgroup1"
+			return v, true
+		}
+	}
+	if b, err := os.ReadFile("/proc/meminfo"); err == nil {
+		for _, ln := range strings.Split(string(b), "\n") {
+			if strings.HasPrefix(ln, "MemTotal:") {
+				f := strings.Fields(ln)
+				if len(f) >= 2 {
+					if kb, err := strconv.ParseInt(f[1], 10, 64); err == nil && kb > 0 {
+						*src = "ram"
+						return kb * 1024, true
+					}
+				}
+			}
+		}
+	}
+	return 0, false
 }

@@ -47,7 +47,7 @@
 
 ### 代码风格
 - 使用 `<script setup>` + TypeScript；组件名 PascalCase；样式为 scoped CSS。
-- 文案改动必须中英同步：前端 `web/src/i18n/{zh-CN,en}.json`（键集须完全一致，当前 782 键，增删键后同步本行数字）、后端 `app/locale/{zh-CN,en}.json`。
+- 文案改动必须中英同步：前端 `web/src/i18n/{zh-CN,en}.json`（键集须完全一致，当前 786 键，增删键后同步本行数字）、后端 `app/locale/{zh-CN,en}.json`。
 
 ## 常用命令
 

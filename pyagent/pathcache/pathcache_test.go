@@ -72,6 +72,8 @@ func TestPersistAndReload(t *testing.T) {
 	dir := t.TempDir()
 	c := New(dir)
 	c.Record("agent-a", "eth0", "hash1", "P2P", 0)
+	// 落盘改为脏标记+5s 窗口异步批写（P2 #12）；测试用 Flush 同步排空
+	c.Flush()
 	if _, err := os.Stat(filepath.Join(dir, fileName)); err != nil {
 		t.Fatalf("cache file not written: %v", err)
 	}
